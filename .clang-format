@@ -1,0 +1,13 @@
+---
+# GStreamer-style C formatting
+BasedOnStyle: GNU
+IndentWidth: 2
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+SpaceBeforeParens: ControlStatements
+PointerAlignment: Right
+SortIncludes: false
+---

@@ -1,0 +1,39 @@
+# Build artifacts
+build*/
+*.o
+*.so
+*.so.*
+*.lo
+*.la
+
+# Meson
+subprojects/
+.ninja_*
+
+# Generated files
+config.h
+compile_commands.json
+*.pc
+
+# Editor/IDE
+.cache/
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Planning docs and internal tracking (not shipped)
+docs/
+TODO.md
+
+# GFX module (not ready for release)
+gst/gfx/
+
+# Downloaded dependencies
+deps/
+
+# OS
+.DS_Store
+Thumbs.db

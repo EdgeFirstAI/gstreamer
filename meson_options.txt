@@ -1,0 +1,14 @@
+option('zenoh', type : 'feature', value : 'auto',
+       description : 'Build Zenoh bridge plugin')
+
+option('fusion', type : 'feature', value : 'enabled',
+       description : 'Build fusion processing plugin')
+
+option('hal', type : 'feature', value : 'auto',
+       description : 'Build HAL image processing plugin')
+
+option('tests', type : 'feature', value : 'auto',
+       description : 'Build unit tests')
+
+option('docs', type : 'feature', value : 'auto',
+       description : 'Build documentation')

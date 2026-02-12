@@ -1,0 +1,32 @@
+{
+  // Zenoh configuration for EdgeFirst Perception
+  //
+  // Usage:
+  //   edgefirstzenohsub session=/path/to/zenoh.json5 ...
+  //   edgefirstzenohpub session=/path/to/zenoh.json5 ...
+  //
+  // See: https://zenoh.io/docs/manual/configuration/
+
+  mode: "client",
+
+  connect: {
+    endpoints: [
+      "tcp/127.0.0.1:7447"
+    ]
+  },
+
+  // Shared-memory transport (zero-copy on same host)
+  transport: {
+    shared_memory: {
+      enabled: false
+    }
+  },
+
+  // Scouting for automatic peer discovery
+  scouting: {
+    multicast: {
+      enabled: true,
+      address: "224.0.0.224:7446"
+    }
+  }
+}
