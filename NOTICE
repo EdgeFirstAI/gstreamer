@@ -1,0 +1,25 @@
+EdgeFirst Perception for GStreamer
+Copyright (c) 2026 Au-Zone Technologies
+
+This product includes software developed at Au-Zone Technologies
+(https://au-zone.com/).
+
+This software contains components from the following first-level dependencies
+that require attribution:
+
+  * edgefirst-hal 0.3 (Apache-2.0)
+  * edgefirst-schemas 1.5 (Apache-2.0)
+  * zenoh-c 1.6 (Apache-2.0 OR EPL-2.0)
+
+The following dependencies are dynamically linked under LGPL-2.1-or-later:
+
+  * GStreamer >= 1.20 (LGPL-2.1-or-later)
+  * GLib >= 2.56 (LGPL-2.1-or-later)
+  * json-glib-1.0 (LGPL-2.1-or-later)
+  * NNStreamer >= 2.0 (LGPL-2.1-or-later, optional runtime dependency)
+
+All LGPL-licensed dependencies are used exclusively through dynamic linking,
+preserving the user's ability to replace them with modified versions per LGPL
+requirements.
+
+For complete license texts, see the individual project repositories.

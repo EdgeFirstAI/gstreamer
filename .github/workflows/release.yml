@@ -1,0 +1,137 @@
+# GitHub Actions workflow for publishing releases
+#
+# This workflow orchestrates release publishing when a version tag is pushed:
+# - Calls the SBOM workflow
+# - Creates GitHub Release with SBOM artifact
+#
+# Note: Binaries are built by meta-edgefirst (Yocto), so the only release
+# artifact is the SBOM.
+#
+# Release Process:
+# 1. Update version in meson.build
+# 2. Update CHANGELOG.md with version entry
+# 3. Create and push tag: git tag v1.0.0 && git push --tags
+#
+# Action Versions (verified February 2026):
+# - actions/checkout@v4 (latest)
+# - actions/download-artifact@v4 (latest)
+# - softprops/action-gh-release@v2 (latest)
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  prepare-release:
+    name: Prepare Release Information
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Extracted version: $VERSION"
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          # Extract changelog section for this version
+          # Format: ## [X.Y.Z] - YYYY-MM-DD
+          if [ -f CHANGELOG.md ]; then
+            CHANGELOG=$(awk -v ver="$VERSION" '
+              /^## \['"$VERSION"'\]/ { found=1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            ' CHANGELOG.md)
+          fi
+
+          if [ -z "$CHANGELOG" ]; then
+            echo "WARNING: No changelog entry found for version $VERSION"
+            CHANGELOG="See commit history for details."
+          fi
+
+          echo "changelog<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$CHANGELOG" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+  build-sbom:
+    name: Generate SBOM
+    needs: prepare-release
+    uses: ./.github/workflows/sbom.yml
+
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    needs:
+      - prepare-release
+      - build-sbom
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: artifacts/sbom
+
+      - name: Organize release assets
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          mkdir -p release-assets
+
+          # Copy SBOM
+          if [ -f artifacts/sbom/sbom.json ]; then
+            cp artifacts/sbom/sbom.json \
+               "release-assets/edgefirst-gstreamer-v${RELEASE_VERSION}-sbom.json"
+          fi
+
+          echo "Release assets prepared:"
+          ls -lh release-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        with:
+          name: EdgeFirst Perception for GStreamer v${{ needs.prepare-release.outputs.version }}
+          body: |
+            # EdgeFirst Perception for GStreamer v${{ needs.prepare-release.outputs.version }}
+
+            ## Downloads
+
+            - **SBOM**: `edgefirst-gstreamer-v${{ needs.prepare-release.outputs.version }}-sbom.json`
+
+            > **Note**: Binaries for this library are built as part of the
+            > [meta-edgefirst](https://github.com/EdgeFirstAI/meta-edgefirst) Yocto layer.
+
+            ## What's Changed
+
+            ${{ needs.prepare-release.outputs.changelog }}
+
+            ---
+
+            **Full Documentation**: https://github.com/EdgeFirstAI/gstreamer#readme
+          files: |
+            release-assets/*
+          draft: false
+          prerelease: ${{ contains(needs.prepare-release.outputs.version, '-') }}
+          fail_on_unmatched_files: true

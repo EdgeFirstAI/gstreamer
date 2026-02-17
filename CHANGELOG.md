@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-02-17
+
+### Added
+
+- NOTICE file with first-level dependency attributions
+- SBOM generation via scancode-toolkit (CycloneDX JSON format)
+- License policy checker and NOTICE file validator
+- GitHub Actions workflows for SBOM generation and release publishing
+- Shared library versioning (soversion 0) for libedgefirst-gstreamer-1.0.so
+
 ## [0.1.0] - 2026-02-17
 
 Initial release of EdgeFirst Perception for GStreamer.

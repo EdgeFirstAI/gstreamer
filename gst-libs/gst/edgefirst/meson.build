@@ -26,6 +26,8 @@ gstedgefirst_lib = shared_library('edgefirst-gstreamer-1.0',
   c_args : ['-DBUILDING_GST_EDGEFIRST', '-DHAVE_CONFIG_H'],
   include_directories : [config_inc, edgefirst_inc],
   dependencies : [gst_dep, gst_base_dep, glib_dep, gobject_dep],
+  version : meson.project_version(),
+  soversion : '0',
   install : true,
 )
 
