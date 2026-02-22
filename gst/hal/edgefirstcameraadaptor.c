@@ -143,6 +143,8 @@ struct _EdgefirstCameraAdaptor {
   hal_crop crop;
   hal_fourcc src_fourcc;       /* Input HAL pixel format */
   hal_fourcc target_fourcc;    /* Output HAL pixel format for convert_ref */
+  GstVideoFormat in_vformat;   /* Original GStreamer input format */
+  gboolean needs_input_conversion; /* TRUE when in_vformat needs pixel rewrite */
   gboolean crop_valid;
 
   /* Output dimensions (resolved from properties + input) */
@@ -172,10 +174,12 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (
       "video/x-raw(memory:DMABuf), "
-        "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
+        "format={NV12, NV21, NV16, I420, YV12, YUY2, UYVY, "
+        "RGB, BGR, RGBA, BGRA, RGBx, BGRx, GRAY8}, "
         "width=[1,MAX], height=[1,MAX]; "
       "video/x-raw, "
-        "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
+        "format={NV12, NV21, NV16, I420, YV12, YUY2, UYVY, "
+        "RGB, BGR, RGBA, BGRA, RGBx, BGRx, GRAY8}, "
         "width=[1,MAX], height=[1,MAX]"
     ));
 
@@ -223,11 +227,42 @@ gst_format_to_hal (GstVideoFormat fmt)
 {
   switch (fmt) {
     case GST_VIDEO_FORMAT_NV12:  return HAL_FOURCC_NV12;
+    case GST_VIDEO_FORMAT_NV21:  return HAL_FOURCC_NV12;  /* UV swap in copy */
+    case GST_VIDEO_FORMAT_I420:  return HAL_FOURCC_NV12;  /* planar→semi in copy */
+    case GST_VIDEO_FORMAT_YV12:  return HAL_FOURCC_NV12;  /* planar→semi in copy */
+    case GST_VIDEO_FORMAT_NV16:  return HAL_FOURCC_NV16;
     case GST_VIDEO_FORMAT_YUY2:  return HAL_FOURCC_YUYV;
+    case GST_VIDEO_FORMAT_UYVY:  return HAL_FOURCC_YUYV;  /* byte swap in copy */
     case GST_VIDEO_FORMAT_RGB:   return HAL_FOURCC_RGB;
+    case GST_VIDEO_FORMAT_BGR:   return HAL_FOURCC_RGB;    /* R↔B swap in copy */
     case GST_VIDEO_FORMAT_RGBA:  return HAL_FOURCC_RGBA;
+    case GST_VIDEO_FORMAT_BGRA:  return HAL_FOURCC_RGBA;   /* R↔B swap in copy */
+    case GST_VIDEO_FORMAT_RGBx:  return HAL_FOURCC_RGBA;   /* x treated as alpha */
+    case GST_VIDEO_FORMAT_BGRx:  return HAL_FOURCC_RGBA;   /* R↔B swap in copy */
     case GST_VIDEO_FORMAT_GRAY8: return HAL_FOURCC_GREY;
     default:                     return HAL_FOURCC_RGB;
+  }
+}
+
+/**
+ * Check whether the GStreamer format requires pixel conversion before
+ * it matches the HAL fourcc returned by gst_format_to_hal().  Formats
+ * that need conversion must go through the system-memory copy path.
+ */
+static gboolean
+format_needs_conversion (GstVideoFormat fmt)
+{
+  switch (fmt) {
+    case GST_VIDEO_FORMAT_NV21:
+    case GST_VIDEO_FORMAT_I420:
+    case GST_VIDEO_FORMAT_YV12:
+    case GST_VIDEO_FORMAT_UYVY:
+    case GST_VIDEO_FORMAT_BGR:
+    case GST_VIDEO_FORMAT_BGRA:
+    case GST_VIDEO_FORMAT_BGRx:
+      return TRUE;
+    default:
+      return FALSE;
   }
 }
 
@@ -371,14 +406,18 @@ create_input_image (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
       shape[0] = height * 3 / 2; shape[1] = width; ndim = 2;
       row_bytes = width;
       break;
+    case HAL_FOURCC_NV16:
+      shape[0] = height * 2; shape[1] = width; ndim = 2;
+      row_bytes = width;
+      break;
     default:
       GST_ERROR_OBJECT (self, "unsupported input fourcc %d", fourcc);
       return NULL;
   }
 
-  /* Try DMA-BUF zero-copy path */
+  /* Try DMA-BUF zero-copy path (only for formats with direct HAL mapping) */
   GstMemory *in_mem = gst_buffer_peek_memory (inbuf, 0);
-  if (gst_is_dmabuf_memory (in_mem)) {
+  if (!self->needs_input_conversion && gst_is_dmabuf_memory (in_mem)) {
     gint stride = GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
     gboolean tight = ((gsize) stride == row_bytes);
 
@@ -423,19 +462,124 @@ create_input_image (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
     return NULL;
   }
 
-  if (fourcc == HAL_FOURCC_NV12) {
-    /* Y plane */
+  GstVideoFormat vfmt = self->in_vformat;
+
+  if (fourcc == HAL_FOURCC_NV12 && vfmt == GST_VIDEO_FORMAT_NV12) {
+    /* NV12 native: copy Y + UV planes */
     const guint8 *y_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
     gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
     for (guint y = 0; y < height; y++)
       memcpy (dst + y * width, y_data + y * y_stride, width);
-    /* UV plane */
     const guint8 *uv_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 1);
     gint uv_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 1);
     uint8_t *uv_dst = dst + height * width;
     for (guint y = 0; y < height / 2; y++)
       memcpy (uv_dst + y * width, uv_data + y * uv_stride, width);
+
+  } else if (fourcc == HAL_FOURCC_NV12 && vfmt == GST_VIDEO_FORMAT_NV21) {
+    /* NV21 → NV12: copy Y plane, swap VU→UV in chroma plane */
+    const guint8 *y_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+    for (guint y = 0; y < height; y++)
+      memcpy (dst + y * width, y_data + y * y_stride, width);
+    const guint8 *vu_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 1);
+    gint vu_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 1);
+    uint8_t *uv_dst = dst + height * width;
+    for (guint y = 0; y < height / 2; y++) {
+      const guint8 *vu_row = vu_data + y * vu_stride;
+      uint8_t *uv_row = uv_dst + y * width;
+      for (guint x = 0; x < width; x += 2) {
+        uv_row[x]     = vu_row[x + 1];  /* U */
+        uv_row[x + 1] = vu_row[x];      /* V */
+      }
+    }
+
+  } else if (fourcc == HAL_FOURCC_NV12 &&
+      (vfmt == GST_VIDEO_FORMAT_I420 || vfmt == GST_VIDEO_FORMAT_YV12)) {
+    /* I420/YV12 → NV12: copy Y, interleave U+V (or V+U) into semi-planar */
+    const guint8 *y_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+    for (guint y = 0; y < height; y++)
+      memcpy (dst + y * width, y_data + y * y_stride, width);
+    /* I420: plane1=U, plane2=V.  YV12: plane1=V, plane2=U */
+    int u_plane = (vfmt == GST_VIDEO_FORMAT_I420) ? 1 : 2;
+    int v_plane = (vfmt == GST_VIDEO_FORMAT_I420) ? 2 : 1;
+    const guint8 *u_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, u_plane);
+    gint u_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, u_plane);
+    const guint8 *v_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, v_plane);
+    gint v_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, v_plane);
+    guint half_w = width / 2;
+    uint8_t *uv_dst = dst + height * width;
+    for (guint y = 0; y < height / 2; y++) {
+      const guint8 *u_row = u_data + y * u_stride;
+      const guint8 *v_row = v_data + y * v_stride;
+      uint8_t *uv_row = uv_dst + y * width;
+      for (guint x = 0; x < half_w; x++) {
+        uv_row[x * 2]     = u_row[x];
+        uv_row[x * 2 + 1] = v_row[x];
+      }
+    }
+
+  } else if (fourcc == HAL_FOURCC_NV16) {
+    /* NV16: copy Y + UV planes (full-height UV for 4:2:2) */
+    const guint8 *y_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+    for (guint y = 0; y < height; y++)
+      memcpy (dst + y * width, y_data + y * y_stride, width);
+    const guint8 *uv_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 1);
+    gint uv_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 1);
+    uint8_t *uv_dst = dst + height * width;
+    for (guint y = 0; y < height; y++)
+      memcpy (uv_dst + y * width, uv_data + y * uv_stride, width);
+
+  } else if (fourcc == HAL_FOURCC_YUYV && vfmt == GST_VIDEO_FORMAT_UYVY) {
+    /* UYVY → YUYV: swap byte pairs (U-Y-V-Y → Y-U-Y-V) */
+    const guint8 *src_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+    for (guint y = 0; y < height; y++) {
+      const guint8 *srow = src_data + y * stride;
+      uint8_t *drow = dst + y * row_bytes;
+      for (guint x = 0; x < row_bytes; x += 4) {
+        drow[x]     = srow[x + 1];  /* Y0 */
+        drow[x + 1] = srow[x];      /* U */
+        drow[x + 2] = srow[x + 3];  /* Y1 */
+        drow[x + 3] = srow[x + 2];  /* V */
+      }
+    }
+
+  } else if (fourcc == HAL_FOURCC_RGB && vfmt == GST_VIDEO_FORMAT_BGR) {
+    /* BGR → RGB: swap R↔B channels */
+    const guint8 *src_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+    for (guint y = 0; y < height; y++) {
+      const guint8 *srow = src_data + y * stride;
+      uint8_t *drow = dst + y * row_bytes;
+      for (guint x = 0; x < width; x++) {
+        drow[x * 3]     = srow[x * 3 + 2];  /* R←B */
+        drow[x * 3 + 1] = srow[x * 3 + 1];  /* G */
+        drow[x * 3 + 2] = srow[x * 3];      /* B←R */
+      }
+    }
+
+  } else if (fourcc == HAL_FOURCC_RGBA &&
+      (vfmt == GST_VIDEO_FORMAT_BGRA || vfmt == GST_VIDEO_FORMAT_BGRx)) {
+    /* BGRA/BGRx → RGBA: swap R↔B channels */
+    const guint8 *src_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+    for (guint y = 0; y < height; y++) {
+      const guint8 *srow = src_data + y * stride;
+      uint8_t *drow = dst + y * row_bytes;
+      for (guint x = 0; x < width; x++) {
+        drow[x * 4]     = srow[x * 4 + 2];  /* R←B */
+        drow[x * 4 + 1] = srow[x * 4 + 1];  /* G */
+        drow[x * 4 + 2] = srow[x * 4];      /* B←R */
+        drow[x * 4 + 3] = srow[x * 4 + 3];  /* A/x */
+      }
+    }
+
   } else {
+    /* Direct copy for native formats (NV12 path handled above,
+     * plus RGB, RGBA, RGBx, GRAY8, YUYV) */
     const guint8 *src_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
     gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
     if ((gsize) stride == row_bytes) {
@@ -744,7 +888,13 @@ edgefirst_camera_adaptor_set_caps (GstBaseTransform *trans,
   guint src_w = GST_VIDEO_INFO_WIDTH (&self->in_info);
   guint src_h = GST_VIDEO_INFO_HEIGHT (&self->in_info);
   GstVideoFormat vfmt = GST_VIDEO_INFO_FORMAT (&self->in_info);
+  self->in_vformat = vfmt;
   self->src_fourcc = gst_format_to_hal (vfmt);
+  self->needs_input_conversion = format_needs_conversion (vfmt);
+
+  if (self->needs_input_conversion)
+    GST_INFO_OBJECT (self, "input %s requires pixel conversion to HAL %d",
+        gst_video_format_to_string (vfmt), self->src_fourcc);
 
   /* Resolve output dimensions */
   self->out_width = self->model_width > 0 ? self->model_width : src_w;
