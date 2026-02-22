@@ -296,6 +296,100 @@ run_pipeline_test (guint in_w, guint in_h, const gchar *in_format,
   gst_object_unref (pipeline);
 }
 
+/**
+ * Helper: run a pipeline to completion and return the first output buffer.
+ * Returns NULL if the pipeline fails (caller should skip, not fail).
+ */
+static GstBuffer *
+run_pipeline_pull_buffer (const gchar *pipeline_str)
+{
+  GstElement *pipeline, *sink;
+  GstSample *sample;
+  GstBuffer *buf = NULL;
+  GError *error = NULL;
+
+  pipeline = gst_parse_launch (pipeline_str, &error);
+  if (error) {
+    GST_WARNING ("Pipeline parse error: %s", error->message);
+    g_error_free (error);
+    return NULL;
+  }
+  if (!pipeline || !GST_IS_BIN (pipeline)) {
+    if (pipeline)
+      gst_object_unref (pipeline);
+    return NULL;
+  }
+
+  sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  if (!sink) {
+    gst_object_unref (pipeline);
+    return NULL;
+  }
+  g_object_set (sink, "sync", FALSE, NULL);
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  sample = gst_app_sink_pull_sample (GST_APP_SINK (sink));
+
+  if (sample) {
+    buf = gst_sample_get_buffer (sample);
+    if (buf)
+      buf = gst_buffer_copy (buf);   /* own copy — sample will be freed */
+    gst_sample_unref (sample);
+  }
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (sink);
+  gst_object_unref (pipeline);
+  return buf;
+}
+
+/**
+ * Compare two GstBuffers byte-by-byte with per-byte tolerance.
+ * Returns TRUE if sizes match and no more than max_mismatch_pct percent
+ * of bytes differ by more than @tolerance.
+ */
+static gboolean
+buffers_equal_with_tolerance (GstBuffer *a, GstBuffer *b,
+    guint8 tolerance, gdouble max_mismatch_pct)
+{
+  GstMapInfo ma, mb;
+  gboolean ok = FALSE;
+
+  if (!gst_buffer_map (a, &ma, GST_MAP_READ))
+    return FALSE;
+  if (!gst_buffer_map (b, &mb, GST_MAP_READ)) {
+    gst_buffer_unmap (a, &ma);
+    return FALSE;
+  }
+
+  if (ma.size != mb.size) {
+    GST_WARNING ("size mismatch: %" G_GSIZE_FORMAT " vs %" G_GSIZE_FORMAT,
+        ma.size, mb.size);
+    goto done;
+  }
+
+  gsize mismatches = 0;
+  for (gsize i = 0; i < ma.size; i++) {
+    gint diff = (gint) ma.data[i] - (gint) mb.data[i];
+    if (diff < 0) diff = -diff;
+    if (diff > tolerance)
+      mismatches++;
+  }
+
+  gdouble pct = (ma.size > 0) ? 100.0 * mismatches / ma.size : 0.0;
+  if (pct > max_mismatch_pct) {
+    GST_WARNING ("%.1f%% of bytes differ by >%u (%" G_GSIZE_FORMAT
+        "/%" G_GSIZE_FORMAT ")", pct, tolerance, mismatches, ma.size);
+  } else {
+    ok = TRUE;
+  }
+
+done:
+  gst_buffer_unmap (b, &mb);
+  gst_buffer_unmap (a, &ma);
+  return ok;
+}
+
 GST_START_TEST (test_camera_adaptor_rgb_passthrough)
 {
   /* 320x240 RGB → 320x240 uint8 HWC: output = 320*240*3 = 230400 */
@@ -572,6 +666,239 @@ GST_START_TEST (test_camera_adaptor_letterbox_properties)
 }
 GST_END_TEST;
 
+/* ── TCase "FormatConversion" ─────────────────────────────────────── */
+
+/**
+ * Build a pipeline string that converts videotestsrc output to a given
+ * format, then processes through edgefirstcameraadaptor.
+ */
+static gchar *
+format_test_pipeline (const gchar *format_str)
+{
+  return g_strdup_printf (
+      "videotestsrc num-buffers=1 pattern=smpte ! "
+      "videoconvert ! video/x-raw,format=%s,width=320,height=240 ! "
+      "edgefirstcameraadaptor model-width=160 model-height=160 "
+        "model-dtype=uint8 model-layout=hwc ! "
+      "appsink name=sink",
+      format_str);
+}
+
+/**
+ * Returns TRUE for YUV-family formats where RGB→YUV→RGB roundtrip
+ * introduces colorspace conversion rounding.
+ */
+static gboolean
+format_is_yuv (const gchar *fmt)
+{
+  return (g_strcmp0 (fmt, "NV12") == 0 || g_strcmp0 (fmt, "NV21") == 0 ||
+      g_strcmp0 (fmt, "NV16") == 0 || g_strcmp0 (fmt, "I420") == 0 ||
+      g_strcmp0 (fmt, "YV12") == 0 || g_strcmp0 (fmt, "YUY2") == 0 ||
+      g_strcmp0 (fmt, "UYVY") == 0);
+}
+
+GST_START_TEST (test_format_conversion_all_formats)
+{
+  const gsize expected_size = 160 * 160 * 3;
+
+  /* Generate reference tensors for each colorspace family:
+   *   RGBA  → reference for RGB-family formats (exact match expected)
+   *   NV12  → reference for YUV-family formats (same HAL YUV→RGB path)
+   */
+  gchar *rgba_str = format_test_pipeline ("RGBA");
+  GstBuffer *rgba_ref = run_pipeline_pull_buffer (rgba_str);
+  g_free (rgba_str);
+  fail_unless (rgba_ref != NULL, "Failed to generate RGBA reference tensor");
+
+  GstMapInfo ref_map;
+  fail_unless (gst_buffer_map (rgba_ref, &ref_map, GST_MAP_READ));
+  fail_unless (ref_map.size == expected_size,
+      "Reference tensor size mismatch: %" G_GSIZE_FORMAT, ref_map.size);
+  gst_buffer_unmap (rgba_ref, &ref_map);
+
+  gchar *nv12_str = format_test_pipeline ("NV12");
+  GstBuffer *yuv_ref = run_pipeline_pull_buffer (nv12_str);
+  g_free (nv12_str);
+  fail_unless (yuv_ref != NULL, "Failed to generate NV12 reference tensor");
+
+  /* Query all supported sink formats from the element template */
+  GstElement *el = gst_element_factory_make ("edgefirstcameraadaptor", NULL);
+  fail_unless (el != NULL);
+  GstPad *sinkpad = gst_element_get_static_pad (el, "sink");
+  GstCaps *templ = gst_pad_get_pad_template_caps (sinkpad);
+  gst_object_unref (sinkpad);
+  gst_object_unref (el);
+
+  GstCaps *all_caps = gst_caps_normalize (templ);
+  guint n = gst_caps_get_size (all_caps);
+
+  guint tested = 0, skipped = 0, passed = 0, failed = 0;
+
+  for (guint i = 0; i < n; i++) {
+    GstStructure *s = gst_caps_get_structure (all_caps, i);
+
+    /* Skip DMABuf-featured caps (same formats, different memory) */
+    GstCapsFeatures *features = gst_caps_get_features (all_caps, i);
+    if (features && !gst_caps_features_is_equal (features,
+            gst_caps_features_new_empty ()))
+      continue;
+
+    const gchar *fmt = gst_structure_get_string (s, "format");
+    if (!fmt) continue;
+
+    /* Skip reference formats */
+    if (g_strcmp0 (fmt, "RGBA") == 0 || g_strcmp0 (fmt, "NV12") == 0)
+      continue;
+
+    gchar *pipe = format_test_pipeline (fmt);
+    GstBuffer *buf = run_pipeline_pull_buffer (pipe);
+    g_free (pipe);
+
+    if (!buf) {
+      GST_INFO ("Skipped %s (pipeline failed)", fmt);
+      skipped++;
+      continue;
+    }
+
+    /* Verify output tensor size */
+    GstMapInfo map;
+    fail_unless (gst_buffer_map (buf, &map, GST_MAP_READ));
+    gboolean size_ok = (map.size == expected_size);
+    gst_buffer_unmap (buf, &map);
+
+    if (!size_ok) {
+      GST_ERROR ("FAIL  %s — wrong output size", fmt);
+      gst_buffer_unref (buf);
+      tested++;
+      failed++;
+      continue;
+    }
+
+    tested++;
+
+    if (g_strcmp0 (fmt, "GRAY8") == 0) {
+      /* GRAY8 produces a luminance-only tensor — content comparison against
+       * color reference is meaningless.  Size check is sufficient. */
+      GST_INFO ("PASS  %s (size-only — grayscale)", fmt);
+      passed++;
+    } else if (format_is_yuv (fmt)) {
+      /* YUV formats: compare against NV12 reference (same HAL YUV→RGB path).
+       * Tolerance=4, 5%: accounts for different chroma subsampling and
+       * rounding between YUV sub-formats. */
+      if (buffers_equal_with_tolerance (yuv_ref, buf, 4, 5.0)) {
+        GST_INFO ("PASS  %s (vs NV12 reference)", fmt);
+        passed++;
+      } else {
+        GST_ERROR ("FAIL  %s — does not match NV12 reference", fmt);
+        failed++;
+      }
+    } else {
+      /* RGB-family: strict comparison against RGBA reference */
+      if (buffers_equal_with_tolerance (rgba_ref, buf, 2, 1.0)) {
+        GST_INFO ("PASS  %s", fmt);
+        passed++;
+      } else {
+        GST_ERROR ("FAIL  %s — does not match RGBA reference", fmt);
+        failed++;
+      }
+    }
+
+    gst_buffer_unref (buf);
+  }
+
+  gst_caps_unref (all_caps);
+  gst_buffer_unref (yuv_ref);
+  gst_buffer_unref (rgba_ref);
+
+  g_print ("\n=== Format Conversion Results ===\n"
+      "  Tested:  %u\n  Passed:  %u\n  Failed:  %u\n  Skipped: %u\n\n",
+      tested, passed, failed, skipped);
+
+  fail_unless (failed == 0, "%u format(s) failed conversion validation", failed);
+  fail_unless (tested > 0, "No formats were tested");
+}
+GST_END_TEST;
+
+GST_START_TEST (test_format_timing)
+{
+  GstElement *el = gst_element_factory_make ("edgefirstcameraadaptor", NULL);
+  fail_unless (el != NULL);
+  GstPad *sinkpad = gst_element_get_static_pad (el, "sink");
+  GstCaps *templ = gst_pad_get_pad_template_caps (sinkpad);
+  gst_object_unref (sinkpad);
+  gst_object_unref (el);
+
+  GstCaps *all_caps = gst_caps_normalize (templ);
+  guint n = gst_caps_get_size (all_caps);
+
+  g_print ("\n=== Format Preprocessing Timing ===\n"
+      "  %-8s  %8s  %8s\n", "Format", "Total ms", "Avg ms");
+
+  guint num_buffers = 30;
+
+  for (guint i = 0; i < n; i++) {
+    GstStructure *s = gst_caps_get_structure (all_caps, i);
+    GstCapsFeatures *features = gst_caps_get_features (all_caps, i);
+    if (features && !gst_caps_features_is_equal (features,
+            gst_caps_features_new_empty ()))
+      continue;
+
+    const gchar *fmt = gst_structure_get_string (s, "format");
+    if (!fmt) continue;
+
+    gchar *pipeline_str = g_strdup_printf (
+        "videotestsrc num-buffers=%u pattern=smpte ! "
+        "videoconvert ! video/x-raw,format=%s,width=320,height=240 ! "
+        "edgefirstcameraadaptor model-width=160 model-height=160 "
+          "model-dtype=uint8 model-layout=hwc ! "
+        "appsink name=sink",
+        num_buffers, fmt);
+
+    GstElement *pipeline;
+    GstElement *sink;
+    GError *error = NULL;
+
+    pipeline = gst_parse_launch (pipeline_str, &error);
+    g_free (pipeline_str);
+    if (error || !pipeline) {
+      if (error) g_error_free (error);
+      if (pipeline) gst_object_unref (pipeline);
+      g_print ("  %-8s  %8s  %8s  (skipped)\n", fmt, "-", "-");
+      continue;
+    }
+
+    sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+    g_object_set (sink, "sync", FALSE, NULL);
+
+    gst_element_set_state (pipeline, GST_STATE_PLAYING);
+
+    gint64 t_start = g_get_monotonic_time ();
+    guint received = 0;
+
+    while (received < num_buffers) {
+      GstSample *sample = gst_app_sink_pull_sample (GST_APP_SINK (sink));
+      if (!sample) break;
+      received++;
+      gst_sample_unref (sample);
+    }
+
+    gint64 t_elapsed = g_get_monotonic_time () - t_start;
+    gdouble total_ms = t_elapsed / 1000.0;
+    gdouble avg_ms = (received > 0) ? total_ms / received : 0;
+
+    g_print ("  %-8s  %8.1f  %8.3f  (%u frames)\n",
+        fmt, total_ms, avg_ms, received);
+
+    gst_element_set_state (pipeline, GST_STATE_NULL);
+    gst_object_unref (sink);
+    gst_object_unref (pipeline);
+  }
+
+  g_print ("\n");
+  gst_caps_unref (all_caps);
+}
+GST_END_TEST;
+
 /* ── Suite ─────────────────────────────────────────────────────────── */
 
 static Suite *
@@ -629,6 +956,12 @@ edgefirst_hal_elements_suite (void)
   tcase_add_test (tc_content, test_camera_adaptor_bgr_hwc);
   tcase_add_test (tc_content, test_camera_adaptor_letterbox_properties);
   suite_add_tcase (s, tc_content);
+
+  TCase *tc_formats = tcase_create ("FormatConversion");
+  tcase_set_timeout (tc_formats, 60);  /* format iteration needs more time */
+  tcase_add_test (tc_formats, test_format_conversion_all_formats);
+  tcase_add_test (tc_formats, test_format_timing);
+  suite_add_tcase (s, tc_formats);
 
   return s;
 }

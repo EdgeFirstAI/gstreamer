@@ -3,6 +3,8 @@
 gst_check_dep = dependency('gstreamer-check-1.0', version : gst_version,
                            required : false)
 
+test_install_dir = get_option('libexecdir') / meson.project_name()
+
 if gst_check_dep.found()
   test_env = environment()
   test_env.set('GST_PLUGIN_PATH_1_0', meson.project_build_root())
@@ -14,6 +16,8 @@ if gst_check_dep.found()
     'check/test_meta.c',
     dependencies : [gst_dep, gst_check_dep, gstedgefirst_dep],
     include_directories : [config_inc],
+    install : true,
+    install_dir : test_install_dir,
   )
   test('meta', test_meta, env : test_env)
 
@@ -21,6 +25,8 @@ if gst_check_dep.found()
     'check/test_meta_copy.c',
     dependencies : [gst_dep, gst_check_dep, gstedgefirst_dep],
     include_directories : [config_inc],
+    install : true,
+    install_dir : test_install_dir,
   )
   test('meta_copy', test_meta_copy, env : test_env)
 
@@ -28,6 +34,8 @@ if gst_check_dep.found()
     'check/test_math.c',
     dependencies : [gst_dep, gst_check_dep, gstedgefirst_dep],
     include_directories : [config_inc],
+    install : true,
+    install_dir : test_install_dir,
   )
   test('math', test_math, env : test_env)
 
@@ -38,6 +46,8 @@ if gst_check_dep.found()
     c_args : ['-DFIXTURE_DIR="@0@"'.format(fixture_dir)],
     dependencies : [gst_dep, gst_base_dep, gst_check_dep, gstedgefirst_dep],
     include_directories : [config_inc],
+    install : true,
+    install_dir : test_install_dir,
   )
   test('fusion_elements', test_fusion, env : test_env)
 
@@ -59,6 +69,8 @@ if gst_check_dep.found()
       dependencies : [gst_dep, gst_base_dep, gst_check_dep,
                       gst_allocators_dep, gst_app_dep, gstedgefirst_dep],
       include_directories : [config_inc, hal_src_inc],
+      install : true,
+      install_dir : test_install_dir,
     )
     test('hal_elements', test_hal, env : hal_test_env)
   endif
