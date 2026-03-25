@@ -17,7 +17,6 @@
 #endif
 
 #include "edgefirstcameraadaptor.h"
-#include "edgefirstcameraadaptor-neon.h"
 
 #include <gst/video/video.h>
 #include <gst/allocators/gstdmabuf.h>
