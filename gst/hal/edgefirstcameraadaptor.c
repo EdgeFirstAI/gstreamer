@@ -1076,153 +1076,32 @@ edgefirst_camera_adaptor_transform (GstBaseTransform *trans,
   EdgefirstCameraAdaptor *self = EDGEFIRST_CAMERA_ADAPTOR (trans);
   guint64 t0 = _get_time_ns ();
 
-  /* ── INPUT: Create HAL tensor from video frame ── */
-  hal_tensor *src_img = create_input_image (self, inbuf);
-  if (!src_img) {
-    GST_ERROR_OBJECT (self, "failed to create input image");
+  hal_tensor *src = lookup_or_import_input (self, inbuf);
+  if (!src) {
+    GST_ERROR_OBJECT (self, "failed to get input tensor");
     return GST_FLOW_ERROR;
   }
 
-  guint64 t_input = _get_time_ns ();
-
-  /* ── Single-pass GPU path ──
-   * The GPU converts directly from input (NV12/YUYV/RGBA) to the model
-   * format (PLANAR_RGB I8, RGB U8, etc.) in one pass, rendering into
-   * the Ara-2 pool buffer's DMA-BUF.  No CPU touch, no intermediate. */
-  GstMemory *out_mem = gst_buffer_peek_memory (outbuf, 0);
-  if (gst_is_dmabuf_memory (out_mem)) {
-    int fd = gst_dmabuf_memory_get_fd (out_mem);
-    enum hal_dtype target_dtype = gst_dtype_to_hal (self->dtype);
-
-    struct hal_tensor *render_target =
-        hal_image_processor_create_image_from_fd (self->processor, fd,
-            self->out_width, self->out_height,
-            self->target_fourcc, target_dtype);
-
-    if (render_target) {
-      int ret = hal_image_processor_convert (self->processor, src_img,
-          render_target, HAL_ROTATION_NONE, HAL_FLIP_NONE,
-          self->crop_valid ? &self->crop : NULL);
-
-      hal_tensor_free (render_target);
-      hal_tensor_free (src_img);
-
-      if (ret == 0) {
-        gst_buffer_copy_into (outbuf, inbuf,
-            GST_BUFFER_COPY_TIMESTAMPS | GST_BUFFER_COPY_FLAGS, 0, -1);
-
-        guint64 t_done = _get_time_ns ();
-        GST_LOG_OBJECT (self,
-            "GPU input=%.3fms convert=%.3fms total=%.3fms",
-            (t_input - t0) / 1e6, (t_done - t_input) / 1e6,
-            (t_done - t0) / 1e6);
-        return GST_FLOW_OK;
-      }
-
-      GST_WARNING_OBJECT (self, "GPU single-pass convert failed (%d), "
-          "falling back to convert_ref", ret);
-      /* src_img already freed — need to recreate for fallback */
-      src_img = create_input_image (self, inbuf);
-      if (!src_img) {
-        GST_ERROR_OBJECT (self, "failed to recreate input for fallback");
-        return GST_FLOW_ERROR;
-      }
-    } else {
-      GST_WARNING_OBJECT (self, "create_image_from_fd failed, "
-          "falling back to convert_ref");
-    }
-  }
-
-  /* ── Fallback path: set_format + convert + scalar post-processing ── */
-  if (!self->work_tensor) {
-    hal_tensor_free (src_img);
-    GST_ERROR_OBJECT (self, "work tensor not allocated");
+  hal_tensor *dst = get_output_tensor (self, outbuf);
+  if (!dst) {
+    GST_ERROR_OBJECT (self, "failed to get output tensor");
     return GST_FLOW_ERROR;
   }
 
-  hal_tensor_set_format (self->work_tensor, self->target_fourcc);
-  int ret = hal_image_processor_convert (self->processor, src_img,
-      self->work_tensor,
+  int ret = hal_image_processor_convert (self->processor, src, dst,
       HAL_ROTATION_NONE, HAL_FLIP_NONE,
       self->crop_valid ? &self->crop : NULL);
 
-  hal_tensor_free (src_img);
-
-  guint64 t_ref = _get_time_ns ();
-
   if (ret != 0) {
-    GST_ERROR_OBJECT (self, "HAL convert (fallback) failed (%d)", ret);
+    GST_ERROR_OBJECT (self, "hal_image_processor_convert failed (%d)", ret);
     return GST_FLOW_ERROR;
   }
 
-  /* ── POST-PROCESS + OUTPUT (scalar path) ── */
-  gsize out_size = self->out_width * self->out_height * self->out_channels;
+  gst_buffer_copy_into (outbuf, inbuf,
+      GST_BUFFER_COPY_TIMESTAMPS | GST_BUFFER_COPY_FLAGS, 0, -1);
 
-  GstMapInfo omap;
-  if (!gst_buffer_map (outbuf, &omap, GST_MAP_WRITE)) {
-    GST_ERROR_OBJECT (self, "failed to map output buffer");
-    return GST_FLOW_ERROR;
-  }
-
-  hal_tensor_map *wmap = hal_tensor_map_create (self->work_tensor);
-  const uint8_t *src = hal_tensor_map_data_const (wmap);
-
-  switch (self->dtype) {
-    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT8:
-      if (self->colorspace == EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_BGR &&
-          self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_HWC) {
-        for (gsize i = 0; i < out_size; i += 3) {
-          omap.data[i]     = src[i + 2];
-          omap.data[i + 1] = src[i + 1];
-          omap.data[i + 2] = src[i];
-        }
-      } else if (self->colorspace ==
-          EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_BGR &&
-          self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW) {
-        gsize plane = self->out_width * self->out_height;
-        memcpy (omap.data, src + 2 * plane, plane);
-        memcpy (omap.data + plane, src + plane, plane);
-        memcpy (omap.data + 2 * plane, src, plane);
-      } else {
-        memcpy (omap.data, src, out_size);
-      }
-      break;
-
-    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT8:
-      for (gsize i = 0; i < out_size; i++)
-        omap.data[i] = src[i] ^ 0x80;
-      if (self->colorspace == EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_BGR &&
-          self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_HWC) {
-        for (gsize i = 0; i < out_size; i += 3) {
-          uint8_t tmp = omap.data[i];
-          omap.data[i] = omap.data[i + 2];
-          omap.data[i + 2] = tmp;
-        }
-      }
-      break;
-
-    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT32: {
-      float *fout = (float *) omap.data;
-      guint c = self->out_channels;
-      for (gsize i = 0; i < out_size; i++) {
-        guint ch = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_HWC) ?
-            (i % c) : (i / (self->out_width * self->out_height));
-        fout[i] = ((float) src[i] / 255.0f - self->mean[ch]) / self->std[ch];
-      }
-      break;
-    }
-  }
-
-  hal_tensor_map_unmap (wmap);
-  gst_buffer_unmap (outbuf, &omap);
-
-  {
-    guint64 t_done = _get_time_ns ();
-    GST_LOG_OBJECT (self,
-        "FALLBACK input=%.3fms convert_ref=%.3fms postproc=%.3fms total=%.3fms",
-        (t_input - t0) / 1e6, (t_ref - t_input) / 1e6,
-        (t_done - t_ref) / 1e6, (t_done - t0) / 1e6);
-  }
+  guint64 t_done = _get_time_ns ();
+  GST_LOG_OBJECT (self, "convert %.3fms", (t_done - t0) / 1e6);
 
   return GST_FLOW_OK;
 }
