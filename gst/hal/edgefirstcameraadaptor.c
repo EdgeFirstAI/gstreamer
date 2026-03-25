@@ -1045,9 +1045,33 @@ edgefirst_camera_adaptor_prepare_output_buffer (GstBaseTransform *trans,
     return GST_FLOW_OK;
   }
 
-  /* No downstream pool — allocate a minimal buffer.
-   * The actual data lives in self->hal_output (HAL-owned). */
+  /* No downstream pool — wrap HAL-owned tensor as DMA-BUF GstBuffer.
+   * Ensure the HAL output tensor exists (allocated once, reused). */
+  if (!self->hal_output) {
+    self->hal_output = hal_image_processor_create_image (self->processor,
+        self->out_width, self->out_height,
+        self->target_format, self->target_dtype);
+    if (!self->hal_output) {
+      GST_ERROR_OBJECT (self, "hal_image_processor_create_image failed");
+      return GST_FLOW_ERROR;
+    }
+  }
+
   gsize out_size = self->out_width * self->out_height * self->out_channels;
+
+  /* Try DMA-BUF fd wrapping (zero-copy) */
+  int fd = hal_tensor_clone_fd (self->hal_output);
+  if (fd >= 0) {
+    GstAllocator *alloc = gst_dmabuf_allocator_new ();
+    GstMemory *mem = gst_dmabuf_allocator_alloc (alloc, fd, out_size);
+    gst_object_unref (alloc);
+    *outbuf = gst_buffer_new ();
+    gst_buffer_append_memory (*outbuf, mem);
+    return GST_FLOW_OK;
+  }
+
+  /* Fallback: allocate system memory, copy after convert in transform() */
+  GST_DEBUG_OBJECT (self, "HAL tensor has no fd, using memcpy fallback");
   *outbuf = gst_buffer_new_allocate (NULL, out_size, NULL);
   if (!*outbuf) {
     GST_ERROR_OBJECT (self, "failed to allocate output buffer");
@@ -1084,6 +1108,21 @@ edgefirst_camera_adaptor_transform (GstBaseTransform *trans,
   if (ret != 0) {
     GST_ERROR_OBJECT (self, "hal_image_processor_convert failed (%d)", ret);
     return GST_FLOW_ERROR;
+  }
+
+  /* If outbuf is system memory (not DMA-BUF), copy HAL tensor data into it */
+  GstMemory *out_mem = gst_buffer_peek_memory (outbuf, 0);
+  if (!gst_is_dmabuf_memory (out_mem) && self->hal_output) {
+    struct hal_tensor_map *map = hal_tensor_map_create (dst);
+    if (map) {
+      const void *data = hal_tensor_map_data_const (map);
+      gsize out_size = self->out_width * self->out_height * self->out_channels;
+      gst_buffer_fill (outbuf, 0, data, out_size);
+      hal_tensor_map_unmap (map);
+    } else {
+      GST_ERROR_OBJECT (self, "hal_tensor_map_create failed for output copy");
+      return GST_FLOW_ERROR;
+    }
   }
 
   gst_buffer_copy_into (outbuf, inbuf,
