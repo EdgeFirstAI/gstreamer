@@ -179,9 +179,6 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
       GST_VIDEO_DMA_DRM_CAPS_MAKE "; "
       "video/x-raw(memory:DMABuf), "
         "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
-        "width=[1,MAX], height=[1,MAX]; "
-      "video/x-raw, "
-        "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
         "width=[1,MAX], height=[1,MAX]"
     ));
 
@@ -754,12 +751,9 @@ edgefirst_camera_adaptor_transform_caps (GstBaseTransform *trans,
     gst_structure_set_value (drm_s, "drm-format", &drm_list);
     g_value_unset (&drm_list);
 
-    /* Non-DRM caps (DMABuf + system memory) */
+    /* Non-DRM DMA-BUF caps (no system memory) */
     GstCaps *raw_caps = gst_caps_from_string (
         "video/x-raw(memory:DMABuf), "
-          "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
-          "width=[1,MAX], height=[1,MAX]; "
-        "video/x-raw, "
           "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
           "width=[1,MAX], height=[1,MAX]");
 
