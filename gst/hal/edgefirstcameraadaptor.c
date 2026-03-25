@@ -366,164 +366,86 @@ compute_letterbox (EdgefirstCameraAdaptor *self, guint src_w, guint src_h)
 }
 
 /**
- * Create a HAL tensor from a GstBuffer with pixel format attached.
- * Handles DMA-BUF zero-copy (single-plane and multi-plane) and
- * system-memory (allocate + copy) paths.
- * Returns a newly-allocated tensor (caller must free).
+ * Lookup or import an input DMA-BUF as a HAL image tensor.
+ * V4L2/ISP pools rotate ~4 fds; after one rotation every frame is a cache hit.
+ * Returns a cached tensor (caller must NOT free).
  */
 static hal_tensor *
-create_input_image (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
+lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
 {
   GstVideoInfo *info = &self->in_info;
   guint width = GST_VIDEO_INFO_WIDTH (info);
   guint height = GST_VIDEO_INFO_HEIGHT (info);
-  hal_fourcc fourcc = self->src_fourcc;
+  GstVideoFormat vfmt = GST_VIDEO_INFO_FORMAT (info);
+  enum hal_pixel_format pixel_fmt = gst_format_to_hal_pixel (vfmt);
 
-  /* Determine tensor shape for this pixel format */
-  size_t shape[3];
-  size_t ndim;
-  size_t row_bytes;
-
-  switch (fourcc) {
-    case HAL_FOURCC_RGB:
-      shape[0] = height; shape[1] = width; shape[2] = 3; ndim = 3;
-      row_bytes = width * 3;
-      break;
-    case HAL_FOURCC_RGBA:
-      shape[0] = height; shape[1] = width; shape[2] = 4; ndim = 3;
-      row_bytes = width * 4;
-      break;
-    case HAL_FOURCC_GREY:
-      shape[0] = height; shape[1] = width; shape[2] = 1; ndim = 3;
-      row_bytes = width;
-      break;
-    case HAL_FOURCC_YUYV:
-      shape[0] = height; shape[1] = width; shape[2] = 2; ndim = 3;
-      row_bytes = width * 2;
-      break;
-    case HAL_FOURCC_NV12:
-      shape[0] = height * 3 / 2; shape[1] = width; ndim = 2;
-      row_bytes = width;
-      break;
-    default:
-      GST_ERROR_OBJECT (self, "unsupported input fourcc %d", fourcc);
-      return NULL;
+  if ((int) pixel_fmt == -1) {
+    GST_ERROR_OBJECT (self, "unsupported input format %s",
+        gst_video_format_to_string (vfmt));
+    return NULL;
   }
 
-  /* Try DMA-BUF zero-copy path — only possible with a single memory block
-   * (single DMA-BUF fd containing all planes).  Multi-planar formats like
-   * NM12 (V4L2_PIX_FMT_NV12M) use separate fds per plane and cannot be
-   * wrapped as a single HAL tensor; those fall through to the copy path. */
   guint n_mem = gst_buffer_n_memory (inbuf);
-  if (n_mem == 1) {
-    GstMemory *in_mem = gst_buffer_peek_memory (inbuf, 0);
-    if (gst_is_dmabuf_memory (in_mem)) {
-      /* Prefer buffer-level GstVideoMeta for stride (accurate for VPU
-       * buffers with height padding), fall back to caps-level info. */
-      GstVideoMeta *vmeta = gst_buffer_get_video_meta (inbuf);
-      gint stride = vmeta ? (gint) vmeta->stride[0]
-                          : GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
-      gboolean tight = ((gsize) stride == row_bytes);
+  if (n_mem < 1) {
+    GST_ERROR_OBJECT (self, "input buffer has no memory blocks");
+    return NULL;
+  }
 
-      if (tight) {
-        int fd = dup (gst_dmabuf_memory_get_fd (in_mem));
-        if (fd >= 0) {
-          hal_tensor *t = hal_tensor_from_fd (HAL_DTYPE_U8, fd, shape, ndim,
-              "input");
-          if (t) {
-            if (hal_tensor_set_format (t, fourcc) == 0)
-              return t;
-            hal_tensor_free (t);
-          } else {
-            close (fd);
-          }
-        }
-        GST_DEBUG_OBJECT (self, "DMA-BUF wrap failed, falling back to copy");
-      } else {
-        GST_DEBUG_OBJECT (self, "DMA-BUF stride %d != row_bytes %zu, "
-            "falling back to copy", stride, row_bytes);
+  GstMemory *mem0 = gst_buffer_peek_memory (inbuf, 0);
+  if (!gst_is_dmabuf_memory (mem0)) {
+    GST_ERROR_OBJECT (self, "input buffer is not DMA-BUF");
+    return NULL;
+  }
+
+  int fd = gst_dmabuf_memory_get_fd (mem0);
+  gpointer key = GINT_TO_POINTER (fd);
+
+  /* Cache lookup */
+  hal_tensor *cached = g_hash_table_lookup (self->input_cache, key);
+  if (cached) {
+    GST_LOG_OBJECT (self, "input cache hit fd=%d", fd);
+    return cached;
+  }
+
+  /* Cache miss — import via PlaneDescriptor */
+  GST_DEBUG_OBJECT (self, "input cache miss fd=%d, importing %ux%u %s",
+      fd, width, height, gst_video_format_to_string (vfmt));
+
+  struct hal_plane_descriptor *pd = hal_plane_descriptor_new (fd);
+  if (!pd) {
+    GST_ERROR_OBJECT (self, "hal_plane_descriptor_new failed for fd=%d", fd);
+    return NULL;
+  }
+
+  /* Set stride if padded (e.g. VPU buffers) */
+  GstVideoMeta *vmeta = gst_buffer_get_video_meta (inbuf);
+  gint stride = vmeta ? (gint) vmeta->stride[0]
+                      : GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
+  hal_plane_descriptor_set_stride (pd, (size_t) stride);
+
+  struct hal_plane_descriptor *chroma = NULL;
+  if (n_mem >= 2 && pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
+    GstMemory *mem1 = gst_buffer_peek_memory (inbuf, 1);
+    if (gst_is_dmabuf_memory (mem1)) {
+      int uv_fd = gst_dmabuf_memory_get_fd (mem1);
+      chroma = hal_plane_descriptor_new (uv_fd);
+      if (chroma) {
+        gint uv_stride = vmeta ? (gint) vmeta->stride[1]
+                               : GST_VIDEO_INFO_PLANE_STRIDE (info, 1);
+        hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
       }
     }
-  } else if (n_mem == 2 && fourcc == HAL_FOURCC_NV12) {
-    /* Multi-plane NV12 DMA-BUF: try zero-copy via hal_tensor_from_planes */
-    GstMemory *y_mem = gst_buffer_peek_memory (inbuf, 0);
-    GstMemory *uv_mem = gst_buffer_peek_memory (inbuf, 1);
-    if (gst_is_dmabuf_memory (y_mem) && gst_is_dmabuf_memory (uv_mem)) {
-      int y_fd = dup (gst_dmabuf_memory_get_fd (y_mem));
-      int uv_fd = dup (gst_dmabuf_memory_get_fd (uv_mem));
-      if (y_fd >= 0 && uv_fd >= 0) {
-        hal_tensor *t = NULL;
-        if (hal_tensor_from_planes (y_fd, width, height, uv_fd,
-                HAL_FOURCC_NV12, &t) == 0) {
-          GST_DEBUG_OBJECT (self, "multi-plane NV12 DMA-BUF zero-copy");
-          return t;
-        }
-        /* hal_tensor_from_planes takes ownership on validation pass,
-         * closes fds on internal error — only close on early fail. */
-      } else {
-        if (y_fd >= 0) close (y_fd);
-        if (uv_fd >= 0) close (uv_fd);
-      }
-    }
-    GST_DEBUG_OBJECT (self, "multi-plane NV12 DMA-BUF zero-copy failed, "
-        "falling back to copy");
-  } else if (n_mem > 1) {
-    GST_DEBUG_OBJECT (self, "multi-plane DMA-BUF buffer (%u memories), "
-        "using copy path", n_mem);
   }
 
-  /* System-memory path: allocate tensor and copy frame data */
-  hal_tensor *tensor = hal_tensor_new (HAL_DTYPE_U8, shape, ndim,
-      HAL_TENSOR_MEMORY_MEM, "input");
-  if (!tensor)
-    return NULL;
-
-  hal_tensor_map *tmap = hal_tensor_map_create (tensor);
-  if (!tmap) {
-    hal_tensor_free (tensor);
+  /* hal_import_image CONSUMES pd and chroma */
+  hal_tensor *tensor = hal_import_image (self->processor,
+      pd, chroma, width, height, pixel_fmt, HAL_DTYPE_U8);
+  if (!tensor) {
+    GST_ERROR_OBJECT (self, "hal_import_image failed for fd=%d", fd);
     return NULL;
   }
 
-  uint8_t *dst = hal_tensor_map_data (tmap);
-
-  GstVideoFrame frame;
-  if (!gst_video_frame_map (&frame, info, inbuf, GST_MAP_READ)) {
-    hal_tensor_map_unmap (tmap);
-    hal_tensor_free (tensor);
-    return NULL;
-  }
-
-  if (fourcc == HAL_FOURCC_NV12) {
-    /* Y plane */
-    const guint8 *y_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
-    gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
-    for (guint y = 0; y < height; y++)
-      memcpy (dst + y * width, y_data + y * y_stride, width);
-    /* UV plane */
-    const guint8 *uv_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 1);
-    gint uv_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 1);
-    uint8_t *uv_dst = dst + height * width;
-    for (guint y = 0; y < height / 2; y++)
-      memcpy (uv_dst + y * width, uv_data + y * uv_stride, width);
-  } else {
-    const guint8 *src_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
-    gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
-    if ((gsize) stride == row_bytes) {
-      memcpy (dst, src_data, row_bytes * height);
-    } else {
-      for (guint y = 0; y < height; y++)
-        memcpy (dst + y * row_bytes, src_data + y * stride, row_bytes);
-    }
-  }
-
-  gst_video_frame_unmap (&frame);
-  hal_tensor_map_unmap (tmap);
-
-  if (hal_tensor_set_format (tensor, fourcc) != 0) {
-    hal_tensor_free (tensor);
-    GST_ERROR_OBJECT (self, "hal_tensor_set_format failed");
-    return NULL;
-  }
+  g_hash_table_insert (self->input_cache, key, tensor);
   return tensor;
 }
 
