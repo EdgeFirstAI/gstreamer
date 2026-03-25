@@ -21,8 +21,6 @@
 #include <gst/video/video.h>
 #include <gst/allocators/gstdmabuf.h>
 #include <edgefirst/hal.h>
-#include <string.h>
-#include <unistd.h>
 #include <time.h>
 
 GST_DEBUG_CATEGORY_STATIC (edgefirst_camera_adaptor_debug);
@@ -824,8 +822,8 @@ edgefirst_camera_adaptor_set_caps (GstBaseTransform *trans,
   guint src_w = GST_VIDEO_INFO_WIDTH (&self->in_info);
   guint src_h = GST_VIDEO_INFO_HEIGHT (&self->in_info);
   GstVideoFormat vfmt = GST_VIDEO_INFO_FORMAT (&self->in_info);
-  self->src_fourcc = gst_format_to_hal (vfmt);
-  if ((int) self->src_fourcc == -1) {
+
+  if ((int) gst_format_to_hal_pixel (vfmt) == -1) {
     GST_ERROR_OBJECT (self, "unsupported input format %s",
         gst_video_format_to_string (vfmt));
     return FALSE;
@@ -837,14 +835,11 @@ edgefirst_camera_adaptor_set_caps (GstBaseTransform *trans,
   self->out_channels = (self->colorspace ==
       EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY) ? 1 : 3;
 
-  /* Determine target fourcc for convert_ref (fallback path) */
-  if (self->colorspace == EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY) {
-    self->target_fourcc = HAL_FOURCC_GREY;
-  } else if (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW) {
-    self->target_fourcc = HAL_FOURCC_PLANAR_RGB;
-  } else {
-    self->target_fourcc = HAL_FOURCC_RGB;
-  }
+  /* Resolve target HAL format/dtype from properties */
+  resolve_target_format (self);
+
+  /* Invalidate caches — format/resolution may have changed */
+  clear_caches (self);
 
   /* Compute letterbox geometry */
   compute_letterbox (self, src_w, src_h);
@@ -891,7 +886,7 @@ edgefirst_camera_adaptor_transform_size (GstBaseTransform *trans,
     if (w == 0 || h == 0)
       return FALSE;
 
-    *othersize = w * h * c * output_element_size (self->dtype);
+    *othersize = w * h * c;
     return TRUE;
   }
 
