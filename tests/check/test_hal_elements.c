@@ -10,7 +10,7 @@
 #include <gst/app/gstappsink.h>
 #include <string.h>
 #include <math.h>
-#include "edgefirstcameraadaptor-neon.h"
+/* NEON header removed — HAL 0.12.0 handles all post-processing */
 
 /* ── TCase "Creation" ──────────────────────────────────────────────── */
 
@@ -350,124 +350,6 @@ GST_START_TEST (test_camera_adaptor_float32)
 }
 GST_END_TEST;
 
-/* ── TCase "NeonKernels" ───────────────────────────────────────────── */
-
-GST_START_TEST (test_neon_rgba_to_rgb_u8)
-{
-  /* 4 pixels: known RGBA → verify RGB, alpha dropped */
-  const uint8_t rgba[] = {
-    10, 20, 30, 255,
-    40, 50, 60, 128,
-    70, 80, 90, 0,
-    100, 110, 120, 200,
-  };
-  uint8_t rgb[12] = { 0 };
-
-  edgefirst_neon_rgba_to_rgb_u8 (rgba, rgb, 4, FALSE);
-  fail_unless_equals_int (rgb[0], 10);
-  fail_unless_equals_int (rgb[1], 20);
-  fail_unless_equals_int (rgb[2], 30);
-  fail_unless_equals_int (rgb[3], 40);
-  fail_unless_equals_int (rgb[4], 50);
-  fail_unless_equals_int (rgb[5], 60);
-  fail_unless_equals_int (rgb[9], 100);
-  fail_unless_equals_int (rgb[10], 110);
-  fail_unless_equals_int (rgb[11], 120);
-}
-GST_END_TEST;
-
-GST_START_TEST (test_neon_rgba_to_rgb_u8_bgr)
-{
-  const uint8_t rgba[] = { 10, 20, 30, 255, 40, 50, 60, 128 };
-  uint8_t rgb[6] = { 0 };
-
-  edgefirst_neon_rgba_to_rgb_u8 (rgba, rgb, 2, TRUE);
-  /* BGR: R/B swapped */
-  fail_unless_equals_int (rgb[0], 30);  /* B */
-  fail_unless_equals_int (rgb[1], 20);  /* G */
-  fail_unless_equals_int (rgb[2], 10);  /* R */
-  fail_unless_equals_int (rgb[3], 60);
-  fail_unless_equals_int (rgb[4], 50);
-  fail_unless_equals_int (rgb[5], 40);
-}
-GST_END_TEST;
-
-GST_START_TEST (test_neon_rgba_to_rgb_i8)
-{
-  const uint8_t rgba[] = { 0, 127, 128, 255, 255, 0, 1, 200 };
-  uint8_t rgb[6] = { 0 };
-
-  edgefirst_neon_rgba_to_rgb_i8 (rgba, rgb, 2, FALSE);
-  /* XOR 0x80: 0→0x80, 127→0xFF, 128→0, 255→0x7F */
-  fail_unless_equals_int (rgb[0], 0x80);
-  fail_unless_equals_int (rgb[1], 0xFF);
-  fail_unless_equals_int (rgb[2], 0x00);
-  fail_unless_equals_int (rgb[3], 0x7F);
-  fail_unless_equals_int (rgb[4], 0x80);
-  fail_unless_equals_int (rgb[5], 0x81);
-}
-GST_END_TEST;
-
-GST_START_TEST (test_neon_planar_u8_to_i8)
-{
-  const uint8_t src[] = { 0x00, 0x7F, 0x80, 0xFF };
-  uint8_t dst[4] = { 0 };
-
-  edgefirst_neon_planar_u8_to_i8 (src, dst, 4);
-  fail_unless_equals_int (dst[0], 0x80);
-  fail_unless_equals_int (dst[1], 0xFF);
-  fail_unless_equals_int (dst[2], 0x00);
-  fail_unless_equals_int (dst[3], 0x7F);
-}
-GST_END_TEST;
-
-GST_START_TEST (test_neon_rgba_to_rgb_f32)
-{
-  const uint8_t rgba[] = { 255, 0, 128, 255 };
-  float rgb[3] = { 0 };
-  const float mean[3] = { 0.0f, 0.0f, 0.0f };
-  const float std[3] = { 1.0f, 1.0f, 1.0f };
-
-  edgefirst_neon_rgba_to_rgb_f32 (rgba, rgb, 1, mean, std, FALSE);
-  /* 255/255=1.0, 0/255=0.0, 128/255≈0.502 */
-  fail_unless (fabsf (rgb[0] - 1.0f) < 0.001f,
-      "Expected ~1.0, got %f", rgb[0]);
-  fail_unless (fabsf (rgb[1] - 0.0f) < 0.001f,
-      "Expected ~0.0, got %f", rgb[1]);
-  fail_unless (fabsf (rgb[2] - 128.0f / 255.0f) < 0.001f,
-      "Expected ~0.502, got %f", rgb[2]);
-}
-GST_END_TEST;
-
-GST_START_TEST (test_neon_large_buffer)
-{
-  /* 640x640 = 409600 pixels — tests NEON/scalar boundary handling */
-  size_t npixels = 640 * 640;
-  uint8_t *rgba = g_malloc (npixels * 4);
-  uint8_t *rgb = g_malloc (npixels * 3);
-
-  /* Fill with known pattern */
-  for (size_t i = 0; i < npixels; i++) {
-    rgba[i * 4 + 0] = (uint8_t) (i & 0xFF);
-    rgba[i * 4 + 1] = (uint8_t) ((i >> 8) & 0xFF);
-    rgba[i * 4 + 2] = (uint8_t) ((i >> 16) & 0xFF);
-    rgba[i * 4 + 3] = 0xFF;
-  }
-
-  edgefirst_neon_rgba_to_rgb_u8 (rgba, rgb, npixels, FALSE);
-
-  /* Spot-check a few pixels */
-  for (size_t i = 0; i < npixels; i += 10000) {
-    fail_unless_equals_int (rgb[i * 3 + 0], (uint8_t) (i & 0xFF));
-    fail_unless_equals_int (rgb[i * 3 + 1], (uint8_t) ((i >> 8) & 0xFF));
-    fail_unless_equals_int (rgb[i * 3 + 2], (uint8_t) ((i >> 16) & 0xFF));
-  }
-
-  g_free (rgba);
-  g_free (rgb);
-}
-GST_END_TEST;
-
 /* ── TCase "PipelineContent" ──────────────────────────────────────── */
 
 GST_START_TEST (test_camera_adaptor_chw_int8)
@@ -613,15 +495,6 @@ edgefirst_hal_elements_suite (void)
   tcase_add_test (tc_pipeline, test_camera_adaptor_chw_layout);
   tcase_add_test (tc_pipeline, test_camera_adaptor_float32);
   suite_add_tcase (s, tc_pipeline);
-
-  TCase *tc_neon = tcase_create ("NeonKernels");
-  tcase_add_test (tc_neon, test_neon_rgba_to_rgb_u8);
-  tcase_add_test (tc_neon, test_neon_rgba_to_rgb_u8_bgr);
-  tcase_add_test (tc_neon, test_neon_rgba_to_rgb_i8);
-  tcase_add_test (tc_neon, test_neon_planar_u8_to_i8);
-  tcase_add_test (tc_neon, test_neon_rgba_to_rgb_f32);
-  tcase_add_test (tc_neon, test_neon_large_buffer);
-  suite_add_tcase (s, tc_neon);
 
   TCase *tc_content = tcase_create ("PipelineContent");
   tcase_set_timeout (tc_content, 10);
