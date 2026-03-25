@@ -926,21 +926,18 @@ edgefirst_camera_adaptor_decide_allocation (GstBaseTransform *trans,
     GstQuery *query)
 {
   EdgefirstCameraAdaptor *self = EDGEFIRST_CAMERA_ADAPTOR (trans);
-  guint w = self->out_width;
-  guint h = self->out_height;
-  guint c = self->out_channels;
 
-  if (w == 0 || h == 0) {
+  if (self->out_width == 0 || self->out_height == 0) {
     GST_ERROR_OBJECT (self, "output dimensions not configured");
     return FALSE;
   }
 
-  /* Clean up any previous tensors */
-  cleanup_tensors (self);
-
-  /* Check if downstream provided a buffer pool */
-  guint n_pools = gst_query_get_n_allocation_pools (query);
-  gboolean has_pool = (n_pools > 0);
+  /* Clean up previous state */
+  clear_caches (self);
+  if (self->downstream_pool) {
+    gst_buffer_pool_set_active (self->downstream_pool, FALSE);
+    gst_clear_object (&self->downstream_pool);
+  }
 
   /* Check if downstream accepts DMA-BUF */
   self->downstream_dmabuf = FALSE;
@@ -952,18 +949,9 @@ edgefirst_camera_adaptor_decide_allocation (GstBaseTransform *trans,
     gst_clear_object (&alloc);
   }
 
-  /* ── Downstream DMA-BUF pool (Ara-2 zero-copy) ──
-   * Ara-2's tensor_filter proposes a DMA-BUF buffer pool via
-   * propose_allocation.  Pool buffers are pre-registered with the DVPU
-   * proxy (shmfd_register) — the NPU reads them with zero per-frame
-   * overhead (Tier 1: SHM_DESCRIPTOR).
-   *
-   * The GPU renders directly into these pool buffers via
-   * hal_image_processor_create_image_from_fd() — single-pass conversion
-   * from input (NV12/YUYV) to model format (PLANAR_RGB I8 etc.) with
-   * no CPU touch.  tensor_filter recognizes the fd → Tier 1 → true
-   * zero-copy from camera through GPU through NPU. */
-  if (has_pool) {
+  /* Detect downstream DMA-BUF pool (e.g. Ara-2 pre-registered buffers) */
+  guint n_pools = gst_query_get_n_allocation_pools (query);
+  if (n_pools > 0) {
     GstBufferPool *pool = NULL;
     guint pool_size = 0, pool_min = 0, pool_max = 0;
     gst_query_parse_nth_allocation_pool (query, 0, &pool, &pool_size,
@@ -971,53 +959,81 @@ edgefirst_camera_adaptor_decide_allocation (GstBaseTransform *trans,
     if (pool) {
       if (!gst_buffer_pool_is_active (pool))
         gst_buffer_pool_set_active (pool, TRUE);
-      self->downstream_pool = pool;  /* takes ownership of ref */
-      GST_INFO_OBJECT (self, "Using downstream DMA-BUF pool for zero-copy "
+      self->downstream_pool = pool;
+      GST_INFO_OBJECT (self, "using downstream DMA-BUF pool "
           "(size=%u min=%u max=%u)", pool_size, pool_min, pool_max);
     }
   }
 
-  /* ── Allocate fallback tensors ──
-   * The primary path is single-pass GPU via create_image_from_fd().
-   * These tensors are only used if the GPU convert fails on the first
-   * frame (e.g. CPU-only mode, unsupported format). */
-  gboolean dma_available = hal_is_dma_available ();
-  enum hal_tensor_memory mem_type =
-      (self->downstream_dmabuf && dma_available) ?
-      HAL_TENSOR_MEMORY_DMA : HAL_TENSOR_MEMORY_MEM;
-
-  size_t work_shape[3];
-  size_t work_ndim = 3;
-
-  if (self->target_fourcc == HAL_FOURCC_PLANAR_RGB) {
-    work_shape[0] = c; work_shape[1] = h; work_shape[2] = w;
-  } else {
-    work_shape[0] = h; work_shape[1] = w; work_shape[2] = c;
-  }
-
-  self->work_tensor = hal_tensor_new (HAL_DTYPE_U8, work_shape, work_ndim,
-      mem_type, "work");
-
-  if (self->dtype == EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT32) {
-    self->out_float = hal_tensor_new (HAL_DTYPE_F32, work_shape, work_ndim,
-        mem_type, "output_f32");
-  }
-
-  GST_INFO_OBJECT (self, "single-pass GPU: %s → %s %s (pool=%s)",
-      self->src_fourcc == HAL_FOURCC_NV12  ? "NV12" :
-      self->src_fourcc == HAL_FOURCC_YUYV  ? "YUYV" :
-      self->src_fourcc == HAL_FOURCC_RGBA  ? "RGBA" : "?",
-      self->target_fourcc == HAL_FOURCC_PLANAR_RGB ? "PLANAR_RGB" :
-      self->target_fourcc == HAL_FOURCC_RGB        ? "RGB" :
-      self->target_fourcc == HAL_FOURCC_GREY       ? "GREY" : "?",
+  GST_INFO_OBJECT (self, "output: %ux%ux%u %s (pool=%s)",
+      self->out_width, self->out_height, self->out_channels,
       dtype_to_nnstreamer_string (self->dtype),
-      self->downstream_pool ? "DMA-BUF" : "none");
+      self->downstream_pool ? "DMA-BUF" : "HAL-owned");
 
-  /* Don't chain to parent's decide_allocation — the parent tries to set up
-   * a buffer pool for the output caps, but other/tensors caps don't have
-   * a known buffer size in the allocation query.  We handle output buffer
-   * allocation ourselves in prepare_output_buffer. */
+  /* Don't chain to parent — other/tensors caps don't have a known
+   * buffer size in the allocation query. */
   return TRUE;
+}
+
+/* ── Output tensor lookup ────────────────────────────────────────── */
+
+/**
+ * Get or create the output HAL tensor for the current frame.
+ * When a downstream pool is available, the output buffer's DMA-BUF fd
+ * is imported (cached by fd).  Otherwise a HAL-owned image is allocated
+ * once and reused for all frames.
+ */
+static hal_tensor *
+get_output_tensor (EdgefirstCameraAdaptor *self, GstBuffer *outbuf)
+{
+  if (self->downstream_pool) {
+    /* Import the downstream pool buffer's DMA-BUF fd (cached) */
+    GstMemory *out_mem = gst_buffer_peek_memory (outbuf, 0);
+    if (!gst_is_dmabuf_memory (out_mem)) {
+      GST_ERROR_OBJECT (self, "downstream pool buffer is not DMA-BUF");
+      return NULL;
+    }
+    int fd = gst_dmabuf_memory_get_fd (out_mem);
+    gpointer key = GINT_TO_POINTER (fd);
+
+    hal_tensor *cached = g_hash_table_lookup (self->output_cache, key);
+    if (cached) {
+      GST_LOG_OBJECT (self, "output cache hit fd=%d", fd);
+      return cached;
+    }
+
+    GST_DEBUG_OBJECT (self, "output cache miss fd=%d, importing", fd);
+    struct hal_plane_descriptor *pd = hal_plane_descriptor_new (fd);
+    if (!pd) {
+      GST_ERROR_OBJECT (self, "hal_plane_descriptor_new failed for output fd=%d", fd);
+      return NULL;
+    }
+
+    hal_tensor *tensor = hal_import_image (self->processor,
+        pd, NULL, self->out_width, self->out_height,
+        self->target_format, self->target_dtype);
+    if (!tensor) {
+      GST_ERROR_OBJECT (self, "hal_import_image failed for output fd=%d", fd);
+      return NULL;
+    }
+
+    g_hash_table_insert (self->output_cache, key, tensor);
+    return tensor;
+  }
+
+  /* No downstream pool — use HAL-owned output (allocated once) */
+  if (!self->hal_output) {
+    self->hal_output = hal_image_processor_create_image (self->processor,
+        self->out_width, self->out_height,
+        self->target_format, self->target_dtype);
+    if (!self->hal_output) {
+      GST_ERROR_OBJECT (self, "hal_image_processor_create_image failed");
+      return NULL;
+    }
+    GST_DEBUG_OBJECT (self, "created HAL-owned output %ux%u",
+        self->out_width, self->out_height);
+  }
+  return self->hal_output;
 }
 
 /* ── prepare_output_buffer ───────────────────────────────────────── */
@@ -1028,27 +1044,26 @@ edgefirst_camera_adaptor_prepare_output_buffer (GstBaseTransform *trans,
 {
   EdgefirstCameraAdaptor *self = EDGEFIRST_CAMERA_ADAPTOR (trans);
 
-  if (!self->downstream_pool) {
-    GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
-        ("No downstream DMA-BUF pool available"),
-        ("edgefirstcameraadaptor requires a downstream element that "
-         "proposes a DMA-BUF buffer pool (e.g. Ara-2 tensor_filter)"));
+  if (self->downstream_pool) {
+    /* Acquire from downstream's pre-registered DMA-BUF pool */
+    GstFlowReturn ret = gst_buffer_pool_acquire_buffer (
+        self->downstream_pool, outbuf, NULL);
+    if (ret != GST_FLOW_OK) {
+      GST_ERROR_OBJECT (self, "DMA-BUF pool acquire failed: %s",
+          gst_flow_get_name (ret));
+      return ret;
+    }
+    return GST_FLOW_OK;
+  }
+
+  /* No downstream pool — allocate a minimal buffer.
+   * The actual data lives in self->hal_output (HAL-owned). */
+  gsize out_size = self->out_width * self->out_height * self->out_channels;
+  *outbuf = gst_buffer_new_allocate (NULL, out_size, NULL);
+  if (!*outbuf) {
+    GST_ERROR_OBJECT (self, "failed to allocate output buffer");
     return GST_FLOW_ERROR;
   }
-
-  /* Acquire from downstream's (Ara-2) pre-registered DMA-BUF pool.
-   * The pool buffer wraps a DMA-BUF fd that Ara-2 has registered with
-   * the DVPU proxy.  The GPU renders directly into this buffer via
-   * create_image_from_fd — true zero-copy from camera through GPU
-   * through NPU. */
-  GstFlowReturn ret = gst_buffer_pool_acquire_buffer (
-      self->downstream_pool, outbuf, NULL);
-  if (ret != GST_FLOW_OK) {
-    GST_ERROR_OBJECT (self, "DMA-BUF pool acquire failed: %s",
-        gst_flow_get_name (ret));
-    return ret;
-  }
-
   return GST_FLOW_OK;
 }
 
