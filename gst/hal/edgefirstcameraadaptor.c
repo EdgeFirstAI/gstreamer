@@ -266,6 +266,47 @@ resolve_target_format (EdgefirstCameraAdaptor *self)
   }
 }
 
+/* ── Tensor cache helpers ─────────────────────────────────────────── */
+
+static void
+tensor_cache_value_free (gpointer data)
+{
+  hal_tensor_free ((hal_tensor *) data);
+}
+
+static void
+init_caches (EdgefirstCameraAdaptor *self)
+{
+  self->input_cache = g_hash_table_new_full (
+      g_direct_hash, g_direct_equal, NULL, tensor_cache_value_free);
+  self->output_cache = g_hash_table_new_full (
+      g_direct_hash, g_direct_equal, NULL, tensor_cache_value_free);
+}
+
+static void
+clear_caches (EdgefirstCameraAdaptor *self)
+{
+  if (self->input_cache)
+    g_hash_table_remove_all (self->input_cache);
+  if (self->output_cache)
+    g_hash_table_remove_all (self->output_cache);
+  if (self->hal_output) {
+    hal_tensor_free (self->hal_output);
+    self->hal_output = NULL;
+  }
+}
+
+static void
+destroy_caches (EdgefirstCameraAdaptor *self)
+{
+  g_clear_pointer (&self->input_cache, g_hash_table_destroy);
+  g_clear_pointer (&self->output_cache, g_hash_table_destroy);
+  if (self->hal_output) {
+    hal_tensor_free (self->hal_output);
+    self->hal_output = NULL;
+  }
+}
+
 static void
 compute_letterbox (EdgefirstCameraAdaptor *self, guint src_w, guint src_h)
 {
@@ -505,6 +546,8 @@ edgefirst_camera_adaptor_init (EdgefirstCameraAdaptor *self)
   self->lb_left_override = self->lb_right_override = FALSE;
   self->in_info_valid = FALSE;
 
+  init_caches (self);
+
   gst_base_transform_set_in_place (GST_BASE_TRANSFORM (self), FALSE);
 }
 
@@ -513,7 +556,11 @@ edgefirst_camera_adaptor_finalize (GObject *object)
 {
   EdgefirstCameraAdaptor *self = EDGEFIRST_CAMERA_ADAPTOR (object);
 
-  cleanup_tensors (self);
+  destroy_caches (self);
+  if (self->downstream_pool) {
+    gst_buffer_pool_set_active (self->downstream_pool, FALSE);
+    gst_clear_object (&self->downstream_pool);
+  }
   g_clear_pointer (&self->processor, hal_image_processor_free);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -669,7 +716,11 @@ edgefirst_camera_adaptor_stop (GstBaseTransform *trans)
 {
   EdgefirstCameraAdaptor *self = EDGEFIRST_CAMERA_ADAPTOR (trans);
 
-  cleanup_tensors (self);
+  clear_caches (self);
+  if (self->downstream_pool) {
+    gst_buffer_pool_set_active (self->downstream_pool, FALSE);
+    gst_clear_object (&self->downstream_pool);
+  }
   g_clear_pointer (&self->processor, hal_image_processor_free);
   self->in_info_valid = FALSE;
   self->input_is_drm = FALSE;
