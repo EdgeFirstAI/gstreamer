@@ -55,7 +55,6 @@ if gst_check_dep.found()
     hal_src_inc = include_directories('../gst/hal')
     test_hal = executable('test_hal_elements',
       'check/test_hal_elements.c',
-      '../gst/hal/edgefirstcameraadaptor-neon.c',
       dependencies : [gst_dep, gst_base_dep, gst_check_dep,
                       gst_allocators_dep, gst_app_dep, gstedgefirst_dep],
       include_directories : [config_inc, hal_src_inc],
