@@ -998,6 +998,16 @@ get_output_tensor (EdgefirstCameraAdaptor *self, GstBuffer *outbuf)
       return NULL;
     }
 
+    /* Read tensor byte offset from GstMemory (set by NNStreamer's HAL DMA-BUF pool
+     * when the NPU packs multiple tensors at offsets within a single DMA-BUF) */
+    gsize mem_offset = 0;
+    gst_memory_get_sizes (out_mem, &mem_offset, NULL);
+    if (mem_offset > 0) {
+      hal_plane_descriptor_set_offset (pd, mem_offset);
+      GST_DEBUG_OBJECT (self, "output tensor offset=%zu within DMA-BUF fd=%d",
+          mem_offset, fd);
+    }
+
     hal_tensor *tensor = hal_import_image (self->processor,
         pd, NULL, self->out_width, self->out_height,
         self->target_format, self->target_dtype);
