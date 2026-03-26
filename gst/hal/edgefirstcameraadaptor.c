@@ -206,7 +206,8 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_STATIC_CAPS (
       GST_VIDEO_DMA_DRM_CAPS_MAKE "; "
       "video/x-raw(memory:DMABuf), "
-        "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
+        "format={NV12, NV21, NV16, I420, YV12, YUY2, UYVY, "
+        "RGB, BGR, RGBA, BGRA, RGBx, BGRx, GRAY8}, "
         "width=[1,MAX], height=[1,MAX]"
     ));
 
@@ -254,13 +255,45 @@ gst_format_to_hal_pixel (GstVideoFormat fmt)
 {
   switch (fmt) {
     case GST_VIDEO_FORMAT_NV12:  return HAL_PIXEL_FORMAT_NV12;
+    case GST_VIDEO_FORMAT_NV21:  return HAL_PIXEL_FORMAT_NV12;  /* UV swap needed */
+    case GST_VIDEO_FORMAT_I420:  return HAL_PIXEL_FORMAT_NV12;  /* planar→semi needed */
+    case GST_VIDEO_FORMAT_YV12:  return HAL_PIXEL_FORMAT_NV12;  /* planar→semi needed */
+    case GST_VIDEO_FORMAT_NV16:  return HAL_PIXEL_FORMAT_NV16;
     case GST_VIDEO_FORMAT_YUY2:  return HAL_PIXEL_FORMAT_YUYV;
+    case GST_VIDEO_FORMAT_UYVY:  return HAL_PIXEL_FORMAT_YUYV;  /* byte swap needed */
     case GST_VIDEO_FORMAT_RGB:   return HAL_PIXEL_FORMAT_RGB;
+    case GST_VIDEO_FORMAT_BGR:   return HAL_PIXEL_FORMAT_RGB;    /* R↔B swap needed */
     case GST_VIDEO_FORMAT_RGBA:  return HAL_PIXEL_FORMAT_RGBA;
+    case GST_VIDEO_FORMAT_BGRA:  return HAL_PIXEL_FORMAT_RGBA;   /* R↔B swap needed */
+    case GST_VIDEO_FORMAT_RGBx:  return HAL_PIXEL_FORMAT_RGBA;   /* x treated as alpha */
+    case GST_VIDEO_FORMAT_BGRx:  return HAL_PIXEL_FORMAT_RGBA;   /* R↔B swap needed */
     case GST_VIDEO_FORMAT_GRAY8: return HAL_PIXEL_FORMAT_GREY;
     default:                     return (enum hal_pixel_format) -1;
   }
 }
+
+/**
+ * Returns TRUE for formats that do not map directly to a HAL pixel format
+ * and require pixel rewriting before DMA-BUF import.  Such buffers cannot
+ * use the zero-copy path.
+ */
+static gboolean
+format_needs_conversion (GstVideoFormat fmt)
+{
+  switch (fmt) {
+    case GST_VIDEO_FORMAT_NV21:
+    case GST_VIDEO_FORMAT_I420:
+    case GST_VIDEO_FORMAT_YV12:
+    case GST_VIDEO_FORMAT_UYVY:
+    case GST_VIDEO_FORMAT_BGR:
+    case GST_VIDEO_FORMAT_BGRA:
+    case GST_VIDEO_FORMAT_BGRx:
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
 
 static const char *
 dtype_to_nnstreamer_string (EdgefirstCameraAdaptorDtype dtype)
@@ -409,6 +442,11 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
         gst_video_format_to_string (vfmt));
     return NULL;
   }
+
+  if (format_needs_conversion (vfmt))
+    GST_WARNING_OBJECT (self, "format %s requires pixel conversion; "
+        "DMA-BUF zero-copy unavailable for this format",
+        gst_video_format_to_string (vfmt));
 
   guint n_mem = gst_buffer_n_memory (inbuf);
   if (n_mem < 1) {
