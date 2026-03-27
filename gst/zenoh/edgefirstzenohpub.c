@@ -215,158 +215,253 @@ open_zenoh_session (EdgefirstZenohPub *self)
   return TRUE;
 }
 
+/* ── CDR little-endian encoding helpers ────────────────────────────── */
+
+static inline void
+cdr_pad_to (GByteArray *b, size_t align)
+{
+  static const guint8 zeros[8] = { 0 };
+  size_t pad = (align - (b->len % align)) % align;
+  if (pad)
+    g_byte_array_append (b, zeros, (guint) pad);
+}
+
+static inline void
+cdr_write_u8 (GByteArray *b, guint8 v)
+{
+  g_byte_array_append (b, &v, 1);
+}
+
+static inline void
+cdr_write_i32 (GByteArray *b, gint32 v)
+{
+  cdr_pad_to (b, 4);
+  g_byte_array_append (b, (const guint8 *) &v, 4);
+}
+
+static inline void
+cdr_write_u32 (GByteArray *b, guint32 v)
+{
+  cdr_pad_to (b, 4);
+  g_byte_array_append (b, (const guint8 *) &v, 4);
+}
+
+static inline void
+cdr_write_u64 (GByteArray *b, guint64 v)
+{
+  cdr_pad_to (b, 8);
+  g_byte_array_append (b, (const guint8 *) &v, 8);
+}
+
+static inline void
+cdr_write_string (GByteArray *b, const char *s)
+{
+  guint32 len = (guint32) strlen (s ? s : "") + 1;   /* includes null */
+  cdr_write_u32 (b, len);
+  g_byte_array_append (b, (const guint8 *) (s ? s : ""), len);
+}
+
 /* ── Publish helpers ───────────────────────────────────────────────── */
+
+/* Encode sensor_msgs/PointCloud2 to CDR little-endian.
+ * Returns allocated bytes (free with g_free); sets *out_len. */
+static guint8 *
+encode_pointcloud2_cdr (int32_t stamp_sec, uint32_t stamp_nanosec,
+                        const char *frame_id,
+                        uint32_t height, uint32_t width,
+                        uint32_t point_step, uint32_t row_step,
+                        const EdgefirstPointFieldDesc *fields, guint num_fields,
+                        gboolean is_bigendian, gboolean is_dense,
+                        const uint8_t *data, size_t data_len,
+                        size_t *out_len)
+{
+  static const guint8 cdr_le_header[4] = { 0x00, 0x01, 0x00, 0x00 };
+  GByteArray *b = g_byte_array_new ();
+
+  g_byte_array_append (b, cdr_le_header, 4);
+
+  /* Header.stamp + frame_id */
+  cdr_write_i32 (b, stamp_sec);
+  cdr_write_u32 (b, stamp_nanosec);
+  cdr_write_string (b, frame_id);
+
+  cdr_write_u32 (b, height);
+  cdr_write_u32 (b, width);
+
+  /* fields: sequence<PointField> */
+  cdr_write_u32 (b, num_fields);
+  for (guint i = 0; i < num_fields; i++) {
+    cdr_write_string (b, fields[i].name);
+    cdr_write_u32 (b, fields[i].offset);
+    cdr_write_u8 (b, (guint8) fields[i].datatype);
+    cdr_write_u32 (b, fields[i].count);
+  }
+
+  cdr_write_u8 (b, is_bigendian ? 1 : 0);
+  cdr_write_u32 (b, point_step);
+  cdr_write_u32 (b, row_step);
+
+  /* data: sequence<uint8> */
+  cdr_write_u32 (b, (guint32) data_len);
+  if (data_len)
+    g_byte_array_append (b, data, (guint) data_len);
+
+  cdr_write_u8 (b, is_dense ? 1 : 0);
+
+  *out_len = b->len;
+  return g_byte_array_free (b, FALSE);
+}
+
+/* Encode edgefirst_msgs/RadarCube to CDR little-endian.
+ * Field order: Header (stamp, frame_id), timestamp, layout[], cube[], is_complex.
+ * Returns allocated bytes (free with g_free); sets *out_len. */
+static guint8 *
+encode_radarcube_cdr (int32_t stamp_sec, uint32_t stamp_nanosec,
+                      const char *frame_id,
+                      guint64 timestamp,
+                      const guint8 *layout, guint layout_len,
+                      const gint16 *cube, guint cube_len,
+                      gboolean is_complex,
+                      size_t *out_len)
+{
+  static const guint8 cdr_le_header[4] = { 0x00, 0x01, 0x00, 0x00 };
+  GByteArray *b = g_byte_array_new ();
+
+  g_byte_array_append (b, cdr_le_header, 4);
+
+  /* Header */
+  cdr_write_i32 (b, stamp_sec);
+  cdr_write_u32 (b, stamp_nanosec);
+  cdr_write_string (b, frame_id);
+
+  /* timestamp (uint64, 8-byte aligned) */
+  cdr_write_u64 (b, timestamp);
+
+  /* layout: sequence<uint8> */
+  cdr_write_u32 (b, layout_len);
+  if (layout_len)
+    g_byte_array_append (b, layout, layout_len);
+
+  /* cube: sequence<int16> (element count + int16 bytes) */
+  cdr_write_u32 (b, cube_len);
+  if (cube_len)
+    g_byte_array_append (b, (const guint8 *) cube, cube_len * sizeof (gint16));
+
+  /* is_complex */
+  cdr_write_u8 (b, is_complex ? 1 : 0);
+
+  *out_len = b->len;
+  return g_byte_array_free (b, FALSE);
+}
 
 static GstFlowReturn
 publish_pointcloud2 (EdgefirstZenohPub *self, GstBuffer *buffer)
 {
-  RosPointCloud2 *pcd;
   EdgefirstPointCloud2Meta *meta;
   GstMapInfo map;
   GstCaps *caps;
   GstStructure *s;
-  const gchar *fields_str;
+  const gchar *fields_str = NULL;
   EdgefirstPointFieldDesc fields[32];
-  guint num_fields;
-  uint8_t *out_bytes = NULL;
+  guint num_fields = 0;
+  guint8 *out_bytes = NULL;
   size_t out_len = 0;
-
-  pcd = ros_point_cloud2_new ();
-  if (!pcd)
-    return GST_FLOW_ERROR;
+  int32_t stamp_sec = 0;
+  uint32_t stamp_nanosec = 0;
+  const gchar *frame_id = "";
+  gint w = 0, h = 0, ps = 0;
+  gboolean bigendian = FALSE, dense = FALSE;
 
   /* Get caps info */
   caps = gst_pad_get_current_caps (GST_BASE_SINK_PAD (self));
   if (caps) {
     s = gst_caps_get_structure (caps, 0);
-
-    gint w = 0, h = 0, ps = 0;
-    gboolean bigendian = FALSE, dense = FALSE;
-
     gst_structure_get_int (s, "width", &w);
     gst_structure_get_int (s, "height", &h);
     gst_structure_get_int (s, "point-step", &ps);
     gst_structure_get_boolean (s, "is-bigendian", &bigendian);
     gst_structure_get_boolean (s, "is-dense", &dense);
-
-    ros_point_cloud2_set_width (pcd, (uint32_t) w);
-    ros_point_cloud2_set_height (pcd, (uint32_t) h);
-    ros_point_cloud2_set_point_step (pcd, (uint32_t) ps);
-    ros_point_cloud2_set_row_step (pcd, (uint32_t) (w * ps));
-    ros_point_cloud2_set_is_bigendian (pcd, bigendian);
-    ros_point_cloud2_set_is_dense (pcd, dense);
-
-    /* Add fields */
     fields_str = gst_structure_get_string (s, "fields");
     num_fields = edgefirst_parse_point_fields (fields_str, fields, 32);
-
-    for (guint i = 0; i < num_fields; i++) {
-      RosPointField *f = ros_point_field_new ();
-      if (f) {
-        ros_point_field_set_name (f, fields[i].name);
-        ros_point_field_set_datatype (f, fields[i].datatype);
-        ros_point_field_set_offset (f, fields[i].offset);
-        ros_point_field_set_count (f, fields[i].count);
-        ros_point_cloud2_add_field (pcd, f);
-        ros_point_field_free (f);
-      }
-    }
-
     gst_caps_unref (caps);
   }
 
-  /* Set header from meta */
+  /* Get header from meta */
   meta = edgefirst_buffer_get_pointcloud2_meta (buffer);
   if (meta) {
-    RosHeader *hdr = ros_point_cloud2_get_header_mut (pcd);
-    if (hdr && meta->frame_id[0] != '\0')
-      ros_header_set_frame_id (hdr, meta->frame_id);
-    if (hdr && meta->ros_timestamp_ns > 0) {
-      RosTime *stamp = ros_header_get_stamp_mut (hdr);
-      if (stamp) {
-        ros_time_set_sec (stamp,
-            (int32_t) (meta->ros_timestamp_ns / G_GUINT64_CONSTANT (1000000000)));
-        ros_time_set_nanosec (stamp,
-            (uint32_t) (meta->ros_timestamp_ns % G_GUINT64_CONSTANT (1000000000)));
-      }
+    if (meta->frame_id[0] != '\0')
+      frame_id = meta->frame_id;
+    if (meta->ros_timestamp_ns > 0) {
+      stamp_sec = (int32_t) (meta->ros_timestamp_ns / G_GUINT64_CONSTANT (1000000000));
+      stamp_nanosec = (uint32_t) (meta->ros_timestamp_ns % G_GUINT64_CONSTANT (1000000000));
     }
   }
 
-  /* Set point data */
-  if (gst_buffer_map (buffer, &map, GST_MAP_READ)) {
-    ros_point_cloud2_set_data (pcd, map.data, map.size);
-    gst_buffer_unmap (buffer, &map);
-  }
+  if (!gst_buffer_map (buffer, &map, GST_MAP_READ))
+    return GST_FLOW_ERROR;
 
-  /* Serialize and publish */
-  if (ros_point_cloud2_serialize (pcd, &out_bytes, &out_len) == 0) {
+  out_bytes = encode_pointcloud2_cdr (stamp_sec, stamp_nanosec, frame_id,
+      (uint32_t) h, (uint32_t) w, (uint32_t) ps,
+      (uint32_t) (w * ps), fields, num_fields,
+      bigendian, dense, map.data, map.size, &out_len);
+
+  gst_buffer_unmap (buffer, &map);
+
+  if (out_bytes) {
     z_owned_bytes_t payload;
     z_bytes_copy_from_buf (&payload, out_bytes, out_len);
     z_publisher_put (z_loan (self->publisher), z_move (payload), NULL);
-    free (out_bytes);
+    g_free (out_bytes);
   } else {
-    GST_WARNING_OBJECT (self, "Failed to serialize PointCloud2");
+    GST_WARNING_OBJECT (self, "Failed to encode PointCloud2");
   }
 
-  ros_point_cloud2_free (pcd);
   return GST_FLOW_OK;
 }
 
 static GstFlowReturn
 publish_radarcube (EdgefirstZenohPub *self, GstBuffer *buffer)
 {
-  EdgeFirstRadarCube *cube;
   EdgefirstRadarCubeMeta *meta;
   GstMapInfo map;
-  size_t required_size = 0;
-  uint8_t *out_bytes = NULL;
-
-  cube = edgefirst_radarcube_new ();
-  if (!cube)
-    return GST_FLOW_ERROR;
+  guint8 *out_bytes = NULL;
+  size_t out_len = 0;
+  guint8 layout[EDGEFIRST_RADAR_MAX_DIMS];
+  guint layout_len = 0;
+  guint64 timestamp = 0;
+  const gchar *frame_id = "";
+  gboolean is_complex = FALSE;
 
   meta = edgefirst_buffer_get_radar_cube_meta (buffer);
   if (meta) {
-    /* Set layout */
-    uint8_t layout[EDGEFIRST_RADAR_MAX_DIMS];
+    layout_len = meta->num_dims;
     for (guint8 i = 0; i < meta->num_dims; i++)
-      layout[i] = (uint8_t) meta->layout[i];
-    edgefirst_radarcube_set_layout (cube, layout, meta->num_dims);
-
-    /* Set scales */
-    edgefirst_radarcube_set_scales (cube, meta->scales, meta->num_dims);
-
-    edgefirst_radarcube_set_is_complex (cube, meta->is_complex);
-    edgefirst_radarcube_set_timestamp (cube, meta->radar_timestamp);
-
-    /* Set header */
-    RosHeader *hdr = edgefirst_radarcube_get_header_mut (cube);
-    if (hdr && meta->frame_id[0] != '\0')
-      ros_header_set_frame_id (hdr, meta->frame_id);
+      layout[i] = (guint8) meta->layout[i];
+    timestamp = meta->radar_timestamp;
+    is_complex = meta->is_complex;
+    if (meta->frame_id[0] != '\0')
+      frame_id = meta->frame_id;
   }
 
-  /* Set cube data */
-  if (gst_buffer_map (buffer, &map, GST_MAP_READ)) {
-    edgefirst_radarcube_set_cube (cube,
-        (const int16_t *) map.data, map.size / sizeof (int16_t));
-    gst_buffer_unmap (buffer, &map);
-  }
+  if (!gst_buffer_map (buffer, &map, GST_MAP_READ))
+    return GST_FLOW_ERROR;
 
-  /* Serialize: query size first, then serialize */
-  edgefirst_radarcube_serialize (cube, NULL, 0, &required_size);
-  if (required_size > 0) {
-    out_bytes = g_malloc (required_size);
-    if (edgefirst_radarcube_serialize (cube, out_bytes, required_size, NULL) == 0) {
-      z_owned_bytes_t payload;
-      z_bytes_copy_from_buf (&payload, out_bytes, required_size);
-      z_publisher_put (z_loan (self->publisher), z_move (payload), NULL);
-    } else {
-      GST_WARNING_OBJECT (self, "Failed to serialize RadarCube");
-    }
+  out_bytes = encode_radarcube_cdr (0, 0, frame_id, timestamp,
+      layout, layout_len,
+      (const gint16 *) map.data, (guint) (map.size / sizeof (gint16)),
+      is_complex, &out_len);
+
+  gst_buffer_unmap (buffer, &map);
+
+  if (out_bytes) {
+    z_owned_bytes_t payload;
+    z_bytes_copy_from_buf (&payload, out_bytes, out_len);
+    z_publisher_put (z_loan (self->publisher), z_move (payload), NULL);
     g_free (out_bytes);
+  } else {
+    GST_WARNING_OBJECT (self, "Failed to encode RadarCube");
   }
 
-  edgefirst_radarcube_free (cube);
   return GST_FLOW_OK;
 }
 
@@ -390,53 +485,49 @@ gst_format_to_ros_encoding (GstVideoFormat format)
 static GstFlowReturn
 publish_image (EdgefirstZenohPub *self, GstBuffer *buffer)
 {
-  RosImage *img;
   GstMapInfo map;
   GstCaps *caps;
   GstVideoInfo info;
+  const char *encoding = NULL;
   uint8_t *out_bytes = NULL;
   size_t out_len = 0;
-
-  img = ros_image_new ();
-  if (!img)
-    return GST_FLOW_ERROR;
+  uint32_t width = 0, height = 0, step = 0;
 
   caps = gst_pad_get_current_caps (GST_BASE_SINK_PAD (self));
   if (caps) {
-    const char *encoding;
-
     gst_video_info_from_caps (&info, caps);
     encoding = gst_format_to_ros_encoding (GST_VIDEO_INFO_FORMAT (&info));
     if (!encoding) {
       GST_WARNING_OBJECT (self, "Unsupported video format for ROS encoding");
       gst_caps_unref (caps);
-      ros_image_free (img);
       return GST_FLOW_ERROR;
     }
-
-    ros_image_set_width (img, (uint32_t) GST_VIDEO_INFO_WIDTH (&info));
-    ros_image_set_height (img, (uint32_t) GST_VIDEO_INFO_HEIGHT (&info));
-    ros_image_set_step (img, (uint32_t) GST_VIDEO_INFO_WIDTH (&info)
-        * GST_VIDEO_INFO_COMP_PSTRIDE (&info, 0));
-    ros_image_set_encoding (img, encoding);
+    width = (uint32_t) GST_VIDEO_INFO_WIDTH (&info);
+    height = (uint32_t) GST_VIDEO_INFO_HEIGHT (&info);
+    step = width * (uint32_t) GST_VIDEO_INFO_COMP_PSTRIDE (&info, 0);
     gst_caps_unref (caps);
   }
 
-  if (gst_buffer_map (buffer, &map, GST_MAP_READ)) {
-    ros_image_set_data (img, map.data, map.size);
-    gst_buffer_unmap (buffer, &map);
+  if (!encoding) {
+    GST_WARNING_OBJECT (self, "No caps available for image encoding");
+    return GST_FLOW_ERROR;
   }
 
-  if (ros_image_serialize (img, &out_bytes, &out_len) == 0) {
+  if (!gst_buffer_map (buffer, &map, GST_MAP_READ))
+    return GST_FLOW_ERROR;
+
+  if (ros_image_encode (&out_bytes, &out_len,
+          0, 0, "", height, width, encoding, 0, step,
+          map.data, map.size) == 0) {
     z_owned_bytes_t payload;
     z_bytes_copy_from_buf (&payload, out_bytes, out_len);
     z_publisher_put (z_loan (self->publisher), z_move (payload), NULL);
-    free (out_bytes);
+    ros_bytes_free (out_bytes, out_len);
   } else {
-    GST_WARNING_OBJECT (self, "Failed to serialize Image");
+    GST_WARNING_OBJECT (self, "Failed to encode Image");
   }
 
-  ros_image_free (img);
+  gst_buffer_unmap (buffer, &map);
   return GST_FLOW_OK;
 }
 

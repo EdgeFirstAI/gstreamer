@@ -289,24 +289,72 @@ open_zenoh_session (EdgefirstZenohSub *self)
   return TRUE;
 }
 
+/* ── CDR parsing helper ─────────────────────────────────────────────── */
+
+/* Extract translation and rotation from a TransformStamped CDR buffer.
+ * Walks past the Header strings and child_frame_id to reach the doubles.
+ * Assumes little-endian CDR (standard on aarch64/x86_64). */
+static gboolean
+parse_transform_cdr (const uint8_t *data, size_t len,
+                     double *tx, double *ty, double *tz,
+                     double *rx, double *ry, double *rz, double *rw)
+{
+  size_t off;
+  uint32_t str_len;
+
+  if (!data || len < 4)
+    return FALSE;
+
+  off = 4;   /* skip CDR encapsulation header */
+
+  /* stamp.sec (int32) + stamp.nanosec (uint32) */
+  if (off + 8 > len) return FALSE;
+  off += 8;
+
+  /* frame_id string: uint32 length + chars */
+  if (off + 4 > len) return FALSE;
+  memcpy (&str_len, data + off, 4);
+  off += 4 + str_len;
+  if (off > len) return FALSE;
+
+  /* pad to 4-byte boundary */
+  off = (off + 3) & ~(size_t) 3;
+
+  /* child_frame_id string: uint32 length + chars */
+  if (off + 4 > len) return FALSE;
+  memcpy (&str_len, data + off, 4);
+  off += 4 + str_len;
+  if (off > len) return FALSE;
+
+  /* pad to 8-byte boundary for doubles */
+  off = (off + 7) & ~(size_t) 7;
+
+  /* 7 doubles: tx, ty, tz, rx, ry, rz, rw */
+  if (off + 56 > len) return FALSE;
+  memcpy (tx, data + off,      8);
+  memcpy (ty, data + off + 8,  8);
+  memcpy (tz, data + off + 16, 8);
+  memcpy (rx, data + off + 24, 8);
+  memcpy (ry, data + off + 32, 8);
+  memcpy (rz, data + off + 40, 8);
+  memcpy (rw, data + off + 48, 8);
+  return TRUE;
+}
+
 /* ── Data deserialization handlers ─────────────────────────────────── */
 
 static GstBuffer *
 handle_pointcloud2 (EdgefirstZenohSub *self, const uint8_t *data, size_t len,
     GstCaps **out_caps)
 {
-  RosPointCloud2 *pcd;
+  ros_point_cloud2_t *pcd;
   GstBuffer *buffer;
   const uint8_t *cloud_data;
   size_t cloud_data_len;
   EdgefirstPointCloud2Meta *meta;
-  size_t num_ros_fields;
-  EdgefirstPointFieldDesc gst_fields[32];
-  guint num_gst_fields = 0;
-  gchar *fields_str;
   GstCaps *caps;
 
-  pcd = ros_point_cloud2_deserialize (data, len);
+  pcd = ros_point_cloud2_from_cdr (data, len);
   if (!pcd) {
     GST_WARNING_OBJECT (self, "Failed to deserialize PointCloud2");
     return NULL;
@@ -327,19 +375,13 @@ handle_pointcloud2 (EdgefirstZenohSub *self, const uint8_t *data, size_t len,
     meta->point_count = ros_point_cloud2_get_width (pcd)
         * ros_point_cloud2_get_height (pcd);
 
-    const RosHeader *hdr = ros_point_cloud2_get_header_mut (pcd);
-    if (hdr) {
-      char *frame_id = ros_header_get_frame_id (hdr);
-      if (frame_id) {
-        g_strlcpy (meta->frame_id, frame_id, EDGEFIRST_FRAME_ID_MAX_LEN);
-        free (frame_id);
-      }
-      const RosTime *stamp = ros_header_get_stamp (hdr);
-      if (stamp) {
-        meta->ros_timestamp_ns = (guint64) ros_time_get_sec (stamp) * G_GUINT64_CONSTANT (1000000000)
-            + ros_time_get_nanosec (stamp);
-      }
-    }
+    const char *frame_id = ros_point_cloud2_get_frame_id (pcd);
+    if (frame_id)
+      g_strlcpy (meta->frame_id, frame_id, EDGEFIRST_FRAME_ID_MAX_LEN);
+
+    meta->ros_timestamp_ns =
+        (guint64) ros_point_cloud2_get_stamp_sec (pcd) * G_GUINT64_CONSTANT (1000000000)
+        + ros_point_cloud2_get_stamp_nanosec (pcd);
 
     /* Lookup transform from cache */
     if (meta->frame_id[0] != '\0') {
@@ -348,34 +390,16 @@ handle_pointcloud2 (EdgefirstZenohSub *self, const uint8_t *data, size_t len,
     }
   }
 
-  /* Build field descriptors from ROS fields */
-  num_ros_fields = ros_point_cloud2_get_num_fields (pcd);
-  for (size_t i = 0; i < num_ros_fields && num_gst_fields < 32; i++) {
-    const RosPointField *rf = ros_point_cloud2_get_field_at (pcd, i);
-    char *name = ros_point_field_get_name (rf);
-    if (name) {
-      g_strlcpy (gst_fields[num_gst_fields].name, name, 64);
-      free (name);
-    }
-    gst_fields[num_gst_fields].datatype = ros_point_field_get_datatype (rf);
-    gst_fields[num_gst_fields].offset = ros_point_field_get_offset (rf);
-    gst_fields[num_gst_fields].count = ros_point_field_get_count (rf);
-    num_gst_fields++;
-  }
-
-  fields_str = edgefirst_format_point_fields (gst_fields, num_gst_fields);
-
+  /* fields_len is available but get_field_at() is not in 2.2.0; omit fields from caps */
   caps = gst_caps_new_simple ("application/x-pointcloud2",
       "width", G_TYPE_INT, (gint) ros_point_cloud2_get_width (pcd),
       "height", G_TYPE_INT, (gint) ros_point_cloud2_get_height (pcd),
       "point-step", G_TYPE_INT, (gint) ros_point_cloud2_get_point_step (pcd),
-      "fields", G_TYPE_STRING, fields_str,
       "is-bigendian", G_TYPE_BOOLEAN, (gboolean) ros_point_cloud2_get_is_bigendian (pcd),
       "is-dense", G_TYPE_BOOLEAN, (gboolean) ros_point_cloud2_get_is_dense (pcd),
       NULL);
 
   *out_caps = caps;
-  g_free (fields_str);
 
   ros_point_cloud2_free (pcd);
   return buffer;
@@ -385,81 +409,60 @@ static GstBuffer *
 handle_radarcube (EdgefirstZenohSub *self, const uint8_t *data, size_t len,
     GstCaps **out_caps)
 {
-  EdgeFirstRadarCube *cube;
+  ros_radar_cube_t *cube;
   GstBuffer *buffer;
-  const int16_t *cube_data;
-  size_t cube_data_len;
+  const uint8_t *cube_raw;
+  size_t cube_raw_len;
   EdgefirstRadarCubeMeta *meta;
   const uint8_t *layout;
-  const uint16_t *shape;
-  const float *scales;
-  size_t layout_len, shape_len, scales_len;
+  size_t layout_len;
 
-  cube = edgefirst_radarcube_deserialize (data, len);
+  cube = ros_radar_cube_from_cdr (data, len);
   if (!cube) {
     GST_WARNING_OBJECT (self, "Failed to deserialize RadarCube");
     return NULL;
   }
 
-  cube_data = edgefirst_radarcube_get_cube (cube, &cube_data_len);
-  if (!cube_data || cube_data_len == 0) {
-    edgefirst_radarcube_free (cube);
+  /* cube_raw_len is in bytes; cube_len is number of int16 elements */
+  cube_raw = ros_radar_cube_get_cube_raw (cube, &cube_raw_len);
+  if (!cube_raw || cube_raw_len == 0) {
+    ros_radar_cube_free (cube);
     return NULL;
   }
 
-  buffer = gst_buffer_new_allocate (NULL,
-      cube_data_len * sizeof (int16_t), NULL);
-  gst_buffer_fill (buffer, 0, cube_data, cube_data_len * sizeof (int16_t));
+  buffer = gst_buffer_new_allocate (NULL, cube_raw_len, NULL);
+  gst_buffer_fill (buffer, 0, cube_raw, cube_raw_len);
 
   /* Attach metadata */
   meta = edgefirst_buffer_add_radar_cube_meta (buffer);
   if (meta) {
-    layout = edgefirst_radarcube_get_layout (cube, &layout_len);
-    shape = edgefirst_radarcube_get_shape (cube, &shape_len);
-    scales = edgefirst_radarcube_get_scales (cube, &scales_len);
+    layout = ros_radar_cube_get_layout (cube, &layout_len);
 
     meta->num_dims = (guint8) MIN (layout_len, EDGEFIRST_RADAR_MAX_DIMS);
-    for (guint8 i = 0; i < meta->num_dims; i++)
-      meta->layout[i] = (EdgefirstRadarDimension) layout[i];
-
-    for (guint8 i = 0; i < MIN (scales_len, EDGEFIRST_RADAR_MAX_DIMS); i++)
-      meta->scales[i] = scales[i];
-
-    meta->is_complex = edgefirst_radarcube_get_is_complex (cube);
-    meta->radar_timestamp = edgefirst_radarcube_get_timestamp (cube);
-
-    /* Get frame_id from header */
-    const RosHeader *hdr = edgefirst_radarcube_get_header (cube);
-    if (hdr) {
-      char *frame_id = ros_header_get_frame_id (hdr);
-      if (frame_id) {
-        g_strlcpy (meta->frame_id, frame_id, EDGEFIRST_FRAME_ID_MAX_LEN);
-        free (frame_id);
-      }
+    if (layout) {
+      for (guint8 i = 0; i < meta->num_dims; i++)
+        meta->layout[i] = (EdgefirstRadarDimension) layout[i];
     }
 
-    /* Set caps for tensor data */
-    {
-      GString *dim_str = g_string_new (NULL);
+    /* scales are not available in 2.2.0 API */
+    memset (meta->scales, 0, sizeof (meta->scales));
 
-      for (guint8 i = 0; i < MIN (shape_len, EDGEFIRST_RADAR_MAX_DIMS); i++) {
-        if (i > 0)
-          g_string_append_c (dim_str, ':');
-        g_string_append_printf (dim_str, "%u", shape[i]);
-      }
+    meta->is_complex = ros_radar_cube_get_is_complex (cube);
+    meta->radar_timestamp = ros_radar_cube_get_timestamp (cube);
 
-      *out_caps = gst_caps_new_simple ("other/tensors",
-          "num-tensors", G_TYPE_INT, 1,
-          "types", G_TYPE_STRING, "int16",
-          "dimensions", G_TYPE_STRING, dim_str->str,
-          "format", G_TYPE_STRING, "static",
-          NULL);
+    const char *frame_id = ros_radar_cube_get_frame_id (cube);
+    if (frame_id)
+      g_strlcpy (meta->frame_id, frame_id, EDGEFIRST_FRAME_ID_MAX_LEN);
 
-      g_string_free (dim_str, TRUE);
-    }
+    /* shape info not available in 2.2.0; emit caps without dimensions */
+    *out_caps = gst_caps_new_simple ("other/tensors",
+        "num-tensors", G_TYPE_INT, 1,
+        "types", G_TYPE_STRING, "int16",
+        "format", G_TYPE_STRING, "static",
+        NULL);
   }
 
-  edgefirst_radarcube_free (cube);
+  ros_radar_cube_free (cube);
   return buffer;
 }
 
@@ -491,15 +494,15 @@ static GstBuffer *
 handle_image (EdgefirstZenohSub *self, const uint8_t *data, size_t len,
     GstCaps **out_caps)
 {
-  RosImage *img;
+  ros_image_t *img;
   GstBuffer *buffer;
   const uint8_t *img_data;
   size_t img_data_len;
-  char *encoding;
+  const char *encoding;   /* borrowed — do NOT free */
   GstVideoFormat format;
   GstVideoInfo info;
 
-  img = ros_image_deserialize (data, len);
+  img = ros_image_from_cdr (data, len);
   if (!img) {
     GST_WARNING_OBJECT (self, "Failed to deserialize Image");
     return NULL;
@@ -513,7 +516,6 @@ handle_image (EdgefirstZenohSub *self, const uint8_t *data, size_t len,
 
   encoding = ros_image_get_encoding (img);
   format = ros_encoding_to_gst_format (encoding);
-  free (encoding);
 
   if (format == GST_VIDEO_FORMAT_UNKNOWN) {
     GST_WARNING_OBJECT (self, "Unsupported image encoding");
@@ -536,13 +538,11 @@ handle_image (EdgefirstZenohSub *self, const uint8_t *data, size_t len,
 static GstBuffer *
 handle_camera_info (EdgefirstZenohSub *self, const uint8_t *data, size_t len)
 {
-  RosCameraInfo *ci;
+  ros_camera_info_t *ci;
   GstBuffer *buffer;
   EdgefirstCameraInfoMeta *meta;
-  const double *arr;
-  size_t d_len;
 
-  ci = ros_camera_info_deserialize (data, len);
+  ci = ros_camera_info_from_cdr (data, len);
   if (!ci) {
     GST_WARNING_OBJECT (self, "Failed to deserialize CameraInfo");
     return NULL;
@@ -552,21 +552,12 @@ handle_camera_info (EdgefirstZenohSub *self, const uint8_t *data, size_t len)
   buffer = gst_buffer_new ();
   meta = edgefirst_buffer_add_camera_info_meta (buffer);
   if (meta) {
-    meta->width = ros_camera_info_get_width (ci);
+    meta->width  = ros_camera_info_get_width (ci);
     meta->height = ros_camera_info_get_height (ci);
 
-    arr = ros_camera_info_get_k (ci);
-    if (arr)
-      memcpy (meta->K, arr, sizeof (meta->K));
+    /* K/D/R/P matrix getters removed in 2.2.0; matrices stay zeroed */
 
-    arr = ros_camera_info_get_d (ci, &d_len);
-    if (arr && d_len > 0) {
-      guint n = MIN (d_len, EDGEFIRST_MAX_DISTORTION_COEFFS);
-      memcpy (meta->D, arr, n * sizeof (gdouble));
-      meta->num_distortion_coeffs = (guint8) n;
-    }
-
-    char *model = ros_camera_info_get_distortion_model (ci);
+    const char *model = ros_camera_info_get_distortion_model (ci);  /* borrowed */
     if (model) {
       if (g_strcmp0 (model, "plumb_bob") == 0)
         meta->distortion_model = EDGEFIRST_DISTORTION_PLUMB_BOB;
@@ -574,25 +565,11 @@ handle_camera_info (EdgefirstZenohSub *self, const uint8_t *data, size_t len)
         meta->distortion_model = EDGEFIRST_DISTORTION_EQUIDISTANT;
       else if (g_strcmp0 (model, "rational_polynomial") == 0)
         meta->distortion_model = EDGEFIRST_DISTORTION_RATIONAL;
-      free (model);
     }
 
-    arr = ros_camera_info_get_r (ci);
-    if (arr)
-      memcpy (meta->R, arr, sizeof (meta->R));
-
-    arr = ros_camera_info_get_p (ci);
-    if (arr)
-      memcpy (meta->P, arr, sizeof (meta->P));
-
-    const RosHeader *hdr = ros_camera_info_get_header (ci);
-    if (hdr) {
-      char *frame_id = ros_header_get_frame_id (hdr);
-      if (frame_id) {
-        g_strlcpy (meta->frame_id, frame_id, EDGEFIRST_FRAME_ID_MAX_LEN);
-        free (frame_id);
-      }
-    }
+    const char *frame_id = ros_camera_info_get_frame_id (ci);  /* borrowed */
+    if (frame_id)
+      g_strlcpy (meta->frame_id, frame_id, EDGEFIRST_FRAME_ID_MAX_LEN);
   }
 
   ros_camera_info_free (ci);
@@ -671,52 +648,42 @@ zenoh_sub_tf_handler (z_loaned_sample_t *sample, void *context)
   if (!data || len == 0)
     return;
 
-  RosTransformStamped *tf = ros_transform_stamped_deserialize (data, len);
+  ros_transform_stamped_t *tf = ros_transform_stamped_from_cdr (data, len);
   if (!tf)
     return;
 
   EdgefirstTransformData td;
   edgefirst_transform_data_set_identity (&td);
 
-  /* Extract translation and rotation */
-  const RosTransform *transform = ros_transform_stamped_get_transform (tf);
-  if (transform) {
-    const RosVector3 *trans = ros_transform_get_translation (transform);
-    if (trans) {
-      td.translation[0] = ros_vector3_get_x (trans);
-      td.translation[1] = ros_vector3_get_y (trans);
-      td.translation[2] = ros_vector3_get_z (trans);
-    }
-
-    const RosQuaternion *rot = ros_transform_get_rotation (transform);
-    if (rot) {
-      td.rotation[0] = ros_quaternion_get_x (rot);
-      td.rotation[1] = ros_quaternion_get_y (rot);
-      td.rotation[2] = ros_quaternion_get_z (rot);
-      td.rotation[3] = ros_quaternion_get_w (rot);
+  /* Extract translation and rotation from the raw CDR bytes (no per-field
+   * getters for transform components in 2.2.0 — parse CDR manually) */
+  {
+    size_t cdr_len;
+    const uint8_t *cdr = ros_transform_stamped_as_cdr (tf, &cdr_len);
+    double tx, ty, tz, rx, ry, rz, rw;
+    if (cdr && parse_transform_cdr (cdr, cdr_len, &tx, &ty, &tz, &rx, &ry, &rz, &rw)) {
+      td.translation[0] = tx;
+      td.translation[1] = ty;
+      td.translation[2] = tz;
+      td.rotation[0] = rx;
+      td.rotation[1] = ry;
+      td.rotation[2] = rz;
+      td.rotation[3] = rw;
     }
   }
 
-  /* Extract frame IDs */
-  char *child_frame_id = ros_transform_stamped_get_child_frame_id (tf);
-  if (child_frame_id) {
+  /* Extract frame IDs (borrowed — do NOT free) */
+  const char *child_frame_id = ros_transform_stamped_get_child_frame_id (tf);
+  if (child_frame_id)
     g_strlcpy (td.child_frame_id, child_frame_id, EDGEFIRST_FRAME_ID_MAX_LEN);
-    free (child_frame_id);
-  }
 
-  const RosHeader *hdr = ros_transform_stamped_get_header (tf);
-  if (hdr) {
-    char *frame_id = ros_header_get_frame_id (hdr);
-    if (frame_id) {
-      g_strlcpy (td.parent_frame_id, frame_id, EDGEFIRST_FRAME_ID_MAX_LEN);
-      free (frame_id);
-    }
-    const RosTime *stamp = ros_header_get_stamp (hdr);
-    if (stamp) {
-      td.timestamp_ns = (guint64) ros_time_get_sec (stamp) * G_GUINT64_CONSTANT (1000000000)
-          + ros_time_get_nanosec (stamp);
-    }
-  }
+  const char *frame_id = ros_transform_stamped_get_frame_id (tf);
+  if (frame_id)
+    g_strlcpy (td.parent_frame_id, frame_id, EDGEFIRST_FRAME_ID_MAX_LEN);
+
+  td.timestamp_ns =
+      (guint64) ros_transform_stamped_get_stamp_sec (tf) * G_GUINT64_CONSTANT (1000000000)
+      + ros_transform_stamped_get_stamp_nanosec (tf);
 
   edgefirst_transform_cache_insert (self->transform_cache, &td);
 

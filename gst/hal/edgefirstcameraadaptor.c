@@ -24,6 +24,36 @@
 #include <time.h>
 
 GST_DEBUG_CATEGORY_STATIC (edgefirst_camera_adaptor_debug);
+GST_DEBUG_CATEGORY_STATIC (edgefirst_hal_debug);
+
+/* ── HAL log → GST_DEBUG bridge ──────────────────────────────────── */
+
+static void
+hal_log_to_gst (enum hal_log_level level, const char *target,
+    const char *message, void *userdata G_GNUC_UNUSED)
+{
+  GstDebugLevel gst_level;
+  switch (level) {
+    case HAL_LOG_LEVEL_ERROR: gst_level = GST_LEVEL_ERROR; break;
+    case HAL_LOG_LEVEL_WARN:  gst_level = GST_LEVEL_WARNING; break;
+    case HAL_LOG_LEVEL_INFO:  gst_level = GST_LEVEL_INFO; break;
+    case HAL_LOG_LEVEL_DEBUG: gst_level = GST_LEVEL_DEBUG; break;
+    case HAL_LOG_LEVEL_TRACE: gst_level = GST_LEVEL_TRACE; break;
+    default:                  gst_level = GST_LEVEL_LOG; break;
+  }
+  gst_debug_log (edgefirst_hal_debug, gst_level, target, "", 0, NULL,
+      "%s", message);
+}
+
+static enum hal_log_level
+gst_level_to_hal (GstDebugLevel gst_level)
+{
+  if (gst_level <= GST_LEVEL_ERROR)   return HAL_LOG_LEVEL_ERROR;
+  if (gst_level <= GST_LEVEL_WARNING) return HAL_LOG_LEVEL_WARN;
+  if (gst_level <= GST_LEVEL_INFO)    return HAL_LOG_LEVEL_INFO;
+  if (gst_level <= GST_LEVEL_DEBUG)   return HAL_LOG_LEVEL_DEBUG;
+  return HAL_LOG_LEVEL_TRACE;
+}
 
 /* Monotonic clock for pipeline timing */
 static inline guint64
@@ -1221,4 +1251,6 @@ edgefirst_camera_adaptor_class_init (EdgefirstCameraAdaptorClass *klass)
 
   GST_DEBUG_CATEGORY_INIT (edgefirst_camera_adaptor_debug,
       "edgefirstcameraadaptor", 0, "EdgeFirst Camera Adaptor");
+  GST_DEBUG_CATEGORY_INIT (edgefirst_hal_debug,
+      "edgefirst-hal", 0, "EdgeFirst HAL (routed from libedgefirst_hal)");
 }
