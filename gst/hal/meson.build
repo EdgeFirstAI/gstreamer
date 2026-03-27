@@ -5,7 +5,6 @@ endif
 gst_hal_sources = files(
   'plugin.c',
   'edgefirstcameraadaptor.c',
-  'edgefirstcameraadaptor-neon.c',
   'edgefirstoverlay.c',
 )
 
