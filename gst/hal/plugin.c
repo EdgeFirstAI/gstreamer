@@ -11,6 +11,7 @@
 #include <gst/gst.h>
 #include <gst/edgefirst/edgefirst.h>
 #include "edgefirstcameraadaptor.h"
+#include "edgefirstoverlay.h"
 
 static gboolean
 plugin_init (GstPlugin *plugin)
@@ -22,6 +23,9 @@ plugin_init (GstPlugin *plugin)
 
   ret &= gst_element_register (plugin, "edgefirstcameraadaptor",
       GST_RANK_NONE, EDGEFIRST_TYPE_CAMERA_ADAPTOR);
+
+  ret &= gst_element_register (plugin, "edgefirstoverlay",
+      GST_RANK_NONE, EDGEFIRST_TYPE_OVERLAY);
 
   return ret;
 }
