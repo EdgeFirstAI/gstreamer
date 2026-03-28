@@ -174,8 +174,20 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
       if (t)
         return t;
 
-      GST_DEBUG_OBJECT (self, "hal_import_image failed, falling back to copy");
+      GST_DEBUG_OBJECT (self, "hal_import_image failed for fd=%d", fd);
     }
+  }
+
+  /* Memcpy fallback: either the input buffer is not DMA-BUF or
+   * hal_import_image failed.  Warn once so pipeline operators can
+   * identify zero-copy regressions; subsequent occurrences at trace. */
+  static gboolean memcpy_warned = FALSE;
+  if (G_UNLIKELY (!memcpy_warned)) {
+    memcpy_warned = TRUE;
+    GST_WARNING_OBJECT (self, "memcpy fallback active — input buffer is not "
+        "DMA-BUF or hal_import_image failed. Zero-copy is broken.");
+  } else {
+    GST_LOG_OBJECT (self, "memcpy fallback: copying input frame");
   }
 
   /* System-memory path: allocate HAL image and copy frame data into it */

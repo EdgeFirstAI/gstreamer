@@ -183,9 +183,11 @@ struct _EdgefirstCameraAdaptor {
   /* Output dimensions */
   guint out_width, out_height, out_channels;
 
-  /* Tensor caches — import once per fd, reuse across frames */
-  GHashTable *input_cache;   /* fd (int) -> hal_tensor* */
-  GHashTable *output_cache;  /* fd (int) -> hal_tensor* */
+  /* Tensor caches — import once per (fd, offset), reuse across frames.
+   * Key is (guintptr)((guint64)fd << 32 | (guint32)offset) packed into
+   * a pointer — safe on aarch64 where gpointer is 8 bytes. */
+  GHashTable *input_cache;   /* (fd, offset) -> hal_tensor* */
+  GHashTable *output_cache;  /* fd -> hal_tensor* (pool has one buffer, offset=0) */
   hal_tensor *hal_output;    /* HAL-owned output (when no downstream pool) */
 
   /* DMA-BUF state */
@@ -433,24 +435,30 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
   }
 
   int fd = gst_dmabuf_memory_get_fd (mem0);
-  gpointer key = GINT_TO_POINTER (fd);
+  gsize offset = 0;
+  gst_memory_get_sizes (mem0, &offset, NULL);
+  /* Pack (fd, offset) into a pointer — valid on 64-bit (aarch64) */
+  gpointer key = (gpointer) ((guintptr) ((guint64) (guint) fd << 32 | (guint32) offset));
 
   /* Cache lookup */
   hal_tensor *cached = g_hash_table_lookup (self->input_cache, key);
   if (cached) {
-    GST_LOG_OBJECT (self, "input cache hit fd=%d", fd);
+    GST_LOG_OBJECT (self, "input cache hit fd=%d offset=%" G_GSIZE_FORMAT, fd, offset);
     return cached;
   }
 
   /* Cache miss — import via PlaneDescriptor */
-  GST_DEBUG_OBJECT (self, "input cache miss fd=%d, importing %ux%u %s",
-      fd, width, height, gst_video_format_to_string (vfmt));
+  GST_DEBUG_OBJECT (self, "input cache miss fd=%d offset=%" G_GSIZE_FORMAT
+      " importing %ux%u %s", fd, offset, width, height,
+      gst_video_format_to_string (vfmt));
 
   struct hal_plane_descriptor *pd = hal_plane_descriptor_new (fd);
   if (!pd) {
     GST_ERROR_OBJECT (self, "hal_plane_descriptor_new failed for fd=%d", fd);
     return NULL;
   }
+  if (offset > 0)
+    hal_plane_descriptor_set_offset (pd, offset);
 
   /* Set stride if padded (e.g. VPU buffers) */
   GstVideoMeta *vmeta = gst_buffer_get_video_meta (inbuf);
@@ -463,8 +471,12 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
     GstMemory *mem1 = gst_buffer_peek_memory (inbuf, 1);
     if (gst_is_dmabuf_memory (mem1)) {
       int uv_fd = gst_dmabuf_memory_get_fd (mem1);
+      gsize uv_offset = 0;
+      gst_memory_get_sizes (mem1, &uv_offset, NULL);
       chroma = hal_plane_descriptor_new (uv_fd);
       if (chroma) {
+        if (uv_offset > 0)
+          hal_plane_descriptor_set_offset (chroma, uv_offset);
         gint uv_stride = vmeta ? (gint) vmeta->stride[1]
                                : GST_VIDEO_INFO_PLANE_STRIDE (info, 1);
         hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
