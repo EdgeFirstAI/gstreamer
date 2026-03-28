@@ -206,7 +206,17 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_STATIC_CAPS (
       GST_VIDEO_DMA_DRM_CAPS_MAKE "; "
       "video/x-raw(memory:DMABuf), "
-        "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
+        "format={NV12, NV21, NV16, I420, YV12, YUY2, UYVY, "
+        "RGB, BGR, RGBA, BGRA, RGBx, BGRx, GRAY8}, "
+        "width=[1,MAX], height=[1,MAX]; "
+      /* Sources like libcamerasrc declare video/x-raw (no memory:DMABuf feature)
+       * even when their allocator produces DMABuf-backed memory (linear/mappable
+       * DMABuf follows the GStreamer convention of omitting the caps feature).
+       * Accept video/x-raw here so caps negotiation succeeds; the actual buffer
+       * memory type is checked at runtime via gst_is_dmabuf_memory(). */
+      "video/x-raw, "
+        "format={NV12, NV21, NV16, I420, YV12, YUY2, UYVY, "
+        "RGB, BGR, RGBA, BGRA, RGBx, BGRx, GRAY8}, "
         "width=[1,MAX], height=[1,MAX]"
     ));
 
@@ -779,14 +789,25 @@ edgefirst_camera_adaptor_transform_caps (GstBaseTransform *trans,
     gst_structure_set_value (drm_s, "drm-format", &drm_list);
     g_value_unset (&drm_list);
 
-    /* Non-DRM DMA-BUF caps (no system memory) */
+    /* Non-DRM DMA-BUF caps (preferred over system memory) */
     GstCaps *raw_caps = gst_caps_from_string (
         "video/x-raw(memory:DMABuf), "
           "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
           "width=[1,MAX], height=[1,MAX]");
 
+    /* System memory caps: sources like libcamerasrc declare video/x-raw
+     * without memory:DMABuf even though their allocator produces
+     * DMABuf-backed memory (linear/mappable DMABuf omits the feature per
+     * GStreamer convention).  Accept video/x-raw so caps negotiation
+     * succeeds; actual memory type is verified at runtime. */
+    GstCaps *sys_caps = gst_caps_from_string (
+        "video/x-raw, "
+          "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
+          "width=[1,MAX], height=[1,MAX]");
+
     result = drm_caps;
     gst_caps_append (result, raw_caps);
+    gst_caps_append (result, sys_caps);
   }
 
   if (filter) {
