@@ -21,6 +21,8 @@
 #include <gst/video/video.h>
 #include <gst/allocators/gstdmabuf.h>
 #include <edgefirst/hal.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <time.h>
 
 GST_DEBUG_CATEGORY_STATIC (edgefirst_camera_adaptor_debug);
@@ -183,10 +185,11 @@ struct _EdgefirstCameraAdaptor {
   /* Output dimensions */
   guint out_width, out_height, out_channels;
 
-  /* Tensor caches — import once per (fd, offset), reuse across frames.
-   * Key is (guintptr)((guint64)fd << 32 | (guint32)offset) packed into
-   * a pointer — safe on aarch64 where gpointer is 8 bytes. */
-  GHashTable *input_cache;   /* (fd, offset) -> hal_tensor* */
+  /* Tensor caches — import once per DMA-BUF, reuse across frames.
+   * Input cache keys are heap-allocated InputCacheKey structs (inode + offset).
+   * Using inode instead of fd makes the cache robust to fd number recycling:
+   * the kernel dma_buf inode is stable for the lifetime of the buffer. */
+  GHashTable *input_cache;   /* InputCacheKey* -> hal_tensor* */
   GHashTable *output_cache;  /* fd -> hal_tensor* (pool has one buffer, offset=0) */
   hal_tensor *hal_output;    /* HAL-owned output (when no downstream pool) */
 
@@ -311,11 +314,37 @@ tensor_cache_value_free (gpointer data)
   hal_tensor_free ((hal_tensor *) data);
 }
 
+/* Input cache key: identifies a DMA-BUF by its kernel inode number and byte
+ * offset.  Using the inode rather than the fd number makes the cache robust
+ * to fd recycling: the same physical buffer always has the same inode even if
+ * GStreamer closes and re-exports it with a different fd number. */
+typedef struct {
+  ino_t inode;
+  gsize offset;
+} InputCacheKey;
+
+static guint
+input_cache_key_hash (gconstpointer p)
+{
+  const InputCacheKey *k = p;
+  /* Mix inode and offset into a single 32-bit hash.  Pool sizes are small
+   * (4–16 entries), so collision probability is negligible. */
+  return (guint) (k->inode ^ (k->inode >> 32) ^ (k->offset << 8));
+}
+
+static gboolean
+input_cache_key_equal (gconstpointer a, gconstpointer b)
+{
+  const InputCacheKey *ka = a, *kb = b;
+  return ka->inode == kb->inode && ka->offset == kb->offset;
+}
+
 static void
 init_caches (EdgefirstCameraAdaptor *self)
 {
   self->input_cache = g_hash_table_new_full (
-      g_direct_hash, g_direct_equal, NULL, tensor_cache_value_free);
+      input_cache_key_hash, input_cache_key_equal,
+      g_free, tensor_cache_value_free);
   self->output_cache = g_hash_table_new_full (
       g_direct_hash, g_direct_equal, NULL, tensor_cache_value_free);
 }
@@ -437,19 +466,31 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
   int fd = gst_dmabuf_memory_get_fd (mem0);
   gsize offset = 0;
   gst_memory_get_sizes (mem0, &offset, NULL);
-  /* Pack (fd, offset) into a pointer — valid on 64-bit (aarch64) */
-  gpointer key = (gpointer) ((guintptr) ((guint64) (guint) fd << 32 | (guint32) offset));
 
-  /* Cache lookup */
-  hal_tensor *cached = g_hash_table_lookup (self->input_cache, key);
+  /* Use the kernel dma_buf inode as the stable buffer identity.  fd numbers
+   * are recycled by GStreamer buffer pools and may differ frame-to-frame even
+   * for the same underlying physical buffer, which would cause spurious cache
+   * misses and EGL re-imports (~5 ms penalty each on i.MX 95 Mali-G310). */
+  struct stat st;
+  if (fstat (fd, &st) != 0) {
+    GST_ERROR_OBJECT (self, "fstat failed for input fd=%d: %s",
+        fd, g_strerror (errno));
+    return NULL;
+  }
+  InputCacheKey lookup_key = { .inode = st.st_ino, .offset = offset };
+
+  /* Cache lookup — no allocation needed for lookup, only for insert */
+  hal_tensor *cached = g_hash_table_lookup (self->input_cache, &lookup_key);
   if (cached) {
-    GST_LOG_OBJECT (self, "input cache hit fd=%d offset=%" G_GSIZE_FORMAT, fd, offset);
+    GST_LOG_OBJECT (self, "input cache hit fd=%d inode=%" G_GUINT64_FORMAT
+        " offset=%" G_GSIZE_FORMAT, fd, (guint64) st.st_ino, offset);
     return cached;
   }
 
   /* Cache miss — import via PlaneDescriptor */
-  GST_DEBUG_OBJECT (self, "input cache miss fd=%d offset=%" G_GSIZE_FORMAT
-      " importing %ux%u %s", fd, offset, width, height,
+  GST_DEBUG_OBJECT (self, "input cache miss fd=%d inode=%" G_GUINT64_FORMAT
+      " offset=%" G_GSIZE_FORMAT " importing %ux%u %s",
+      fd, (guint64) st.st_ino, offset, width, height,
       gst_video_format_to_string (vfmt));
 
   struct hal_plane_descriptor *pd = hal_plane_descriptor_new (fd);
@@ -492,7 +533,9 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
     return NULL;
   }
 
-  g_hash_table_insert (self->input_cache, key, tensor);
+  InputCacheKey *heap_key = g_new (InputCacheKey, 1);
+  *heap_key = lookup_key;
+  g_hash_table_insert (self->input_cache, heap_key, tensor);
   return tensor;
 }
 
