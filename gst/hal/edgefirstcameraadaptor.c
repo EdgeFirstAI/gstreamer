@@ -664,6 +664,10 @@ edgefirst_camera_adaptor_start (GstBaseTransform *trans)
   };
   const char *backend_str = compute_names[self->compute];
 
+  /* Route HAL internal logs through GST_DEBUG ("edgefirst-hal" category) */
+  hal_log_init_callback (hal_log_to_gst, NULL,
+      gst_level_to_hal (gst_debug_category_get_threshold (edgefirst_hal_debug)));
+
   GST_INFO_OBJECT (self, "requesting HAL backend: %s", backend_str);
   self->processor = hal_image_processor_new_with_backend (
       compute_map[self->compute]);
