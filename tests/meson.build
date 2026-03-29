@@ -39,11 +39,17 @@ if gst_check_dep.found()
   )
   test('math', test_math, env : test_env)
 
-  fixture_dir = meson.current_source_dir() / 'fixtures'
+  # Fixtures are installed alongside the test binary so it can run on target.
+  # Use the installed path (not source dir) to avoid baking TMPDIR into the binary.
+  installed_fixture_dir = get_option('prefix') / get_option('libexecdir') / meson.project_name() / 'fixtures'
+  install_data(
+    files('fixtures/test_calibration.json', 'fixtures/test_calibration_invalid.json'),
+    install_dir : get_option('libexecdir') / meson.project_name() / 'fixtures',
+  )
 
   test_fusion = executable('test_fusion_elements',
     'check/test_fusion_elements.c',
-    c_args : ['-DFIXTURE_DIR="@0@"'.format(fixture_dir)],
+    c_args : ['-DFIXTURE_DIR="@0@"'.format(installed_fixture_dir)],
     dependencies : [gst_dep, gst_base_dep, gst_check_dep, gstedgefirst_dep],
     include_directories : [config_inc],
     install : true,
