@@ -1054,11 +1054,23 @@ get_output_tensor (EdgefirstCameraAdaptor *self, GstBuffer *outbuf)
       return cached;
     }
 
-    GST_DEBUG_OBJECT (self, "output cache miss fd=%d, importing", fd);
+    gsize mem_offset = 0;
+    gst_memory_get_sizes (out_mem, &mem_offset, NULL);
+    GST_DEBUG_OBJECT (self, "output cache miss fd=%d offset=%" G_GSIZE_FORMAT ", importing",
+        fd, mem_offset);
     struct hal_plane_descriptor *pd = hal_plane_descriptor_new (fd);
     if (!pd) {
       GST_ERROR_OBJECT (self, "hal_plane_descriptor_new failed for output fd=%d", fd);
       return NULL;
+    }
+    if (mem_offset > 0) {
+      if (hal_plane_descriptor_set_offset (pd, (size_t) mem_offset) != 0) {
+        GST_ERROR_OBJECT (self,
+            "hal_plane_descriptor_set_offset failed for fd=%d offset=%" G_GSIZE_FORMAT,
+            fd, mem_offset);
+        hal_plane_descriptor_free (pd);
+        return NULL;
+      }
     }
 
     hal_tensor *tensor = hal_import_image (self->processor,
