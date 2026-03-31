@@ -943,10 +943,12 @@ GST_END_TEST;
 GST_START_TEST (test_overlay_caps_negotiation)
 {
   /* Video sink accepts RGB; src pad output should be RGBA.
-   * fakesrc num-buffers=0 on tensors pad sends immediate EOS. */
+   * fakesrc num-buffers=0 on tensors pad sends immediate EOS.
+   * No caps filter on appsink: overlay may push DMABuf or system-memory
+   * RGBA depending on platform; we verify the format by querying the pad. */
   GstElement *pipeline = gst_parse_launch (
       "videotestsrc num-buffers=1 ! video/x-raw,format=RGB,width=64,height=64 "
-      "! edgefirstoverlay name=ov ! appsink name=sink caps=video/x-raw,format=RGBA  "
+      "! edgefirstoverlay name=ov ! appsink name=sink sync=false "
       "fakesrc num-buffers=0 format=3 "
       "! other/tensors,format=static,num_tensors=1,types=(string)float32,"
         "dimensions=(string)84:8400:1:1,framerate=0/1 "
@@ -962,6 +964,18 @@ GST_START_TEST (test_overlay_caps_negotiation)
   fail_unless (msg != NULL);
   fail_unless (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_EOS,
       "Expected EOS, got %s", gst_message_type_get_name (GST_MESSAGE_TYPE (msg)));
+
+  /* Verify output format is RGBA regardless of memory type (DMABuf or system) */
+  GstElement *sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  GstPad *sink_pad = gst_element_get_static_pad (sink, "sink");
+  GstCaps *actual_caps = gst_pad_get_current_caps (sink_pad);
+  fail_unless (actual_caps != NULL, "No caps on appsink pad after EOS");
+  GstStructure *s = gst_caps_get_structure (actual_caps, 0);
+  const gchar *fmt = gst_structure_get_string (s, "format");
+  fail_unless_equals_string (fmt, "RGBA");
+  gst_caps_unref (actual_caps);
+  gst_object_unref (sink_pad);
+  gst_object_unref (sink);
 
   gst_message_unref (msg);
   gst_object_unref (bus);

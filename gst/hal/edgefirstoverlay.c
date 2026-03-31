@@ -988,6 +988,14 @@ edgefirst_overlay_tensors_event (GstPad *pad G_GNUC_UNUSED,
       return TRUE;
     }
     case GST_EVENT_EOS:
+      /* Tensors EOS: wake up any model-sync waits so they can timeout and
+       * emit frames, but do NOT set flushing — the video chain must continue
+       * draining all video frames until the video EOS arrives. */
+      g_mutex_lock (&self->lock);
+      g_cond_broadcast (&self->decode_cond);
+      g_mutex_unlock (&self->lock);
+      gst_event_unref (event);
+      return TRUE;
     case GST_EVENT_FLUSH_START:
       g_mutex_lock (&self->lock);
       self->flushing = TRUE;

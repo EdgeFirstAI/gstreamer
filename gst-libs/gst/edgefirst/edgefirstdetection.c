@@ -73,7 +73,8 @@ EdgeFirstDetectBoxList *
 edgefirst_detect_box_list_new_normalized (hal_detect_box_list *list,
     gboolean normalized, guint model_w, guint model_h)
 {
-  g_return_val_if_fail (list != NULL, NULL);
+  if (!list)
+    return NULL;
   EdgeFirstDetectBoxList *self =
       g_object_new (EDGEFIRST_TYPE_DETECT_BOX_LIST, NULL);
   self->list       = list;
