@@ -11,6 +11,7 @@
 #include <string.h>
 #include <math.h>
 /* NEON header removed — HAL 0.12.0 handles all post-processing */
+#include <gst/edgefirst/edgefirstdetection.h>
 
 /* ── TCase "Creation" ──────────────────────────────────────────────── */
 
@@ -781,6 +782,364 @@ GST_START_TEST (test_format_timing)
 }
 GST_END_TEST;
 
+/* ── TCase "Overlay" ───────────────────────────────────────────────── */
+
+GST_START_TEST (test_overlay_create)
+{
+  GstElement *el = gst_element_factory_make ("edgefirstoverlay", NULL);
+  fail_unless (el != NULL, "Failed to create edgefirstoverlay");
+
+  /* Check pad existence */
+  GstPad *video   = gst_element_get_static_pad (el, "video");
+  GstPad *tensors = gst_element_get_static_pad (el, "tensors");
+  GstPad *src     = gst_element_get_static_pad (el, "src");
+  fail_unless (video   != NULL, "no 'video' sink pad");
+  fail_unless (tensors != NULL, "no 'tensors' sink pad");
+  fail_unless (src     != NULL, "no 'src' pad");
+
+  gst_object_unref (video);
+  gst_object_unref (tensors);
+  gst_object_unref (src);
+  gst_object_unref (el);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_overlay_properties)
+{
+  GstElement *el = gst_element_factory_make ("edgefirstoverlay", NULL);
+  fail_unless (el != NULL);
+
+  gfloat f; guint u; gboolean b; gchar *s; gint e;
+
+  g_object_get (el, "score-threshold",    &f, NULL); fail_unless (fabs(f - 0.25f) < 1e-5f);
+  g_object_get (el, "iou-threshold",      &f, NULL); fail_unless (fabs(f - 0.45f) < 1e-5f);
+  g_object_get (el, "opacity",            &f, NULL); fail_unless (fabs(f - 0.6f)  < 1e-5f);
+  g_object_get (el, "model-sync",         &b, NULL); fail_unless (b == FALSE);
+  g_object_get (el, "model-sync-timeout", &u, NULL); fail_unless_equals_int (u, 500);
+  g_object_get (el, "color-mode",         &e, NULL); fail_unless_equals_int (e, EDGEFIRST_COLOR_MODE_CLASS);
+  g_object_get (el, "decoder-version",    &s, NULL);
+  fail_unless_equals_string (s, "yolov8");
+  g_free (s);
+  g_object_get (el, "model-config", &s, NULL); fail_unless (s == NULL);
+
+  /* Roundtrip */
+  g_object_set (el, "score-threshold", 0.5f, NULL);
+  g_object_get (el, "score-threshold", &f, NULL);
+  fail_unless (fabs(f - 0.5f) < 1e-5f);
+
+  g_object_set (el, "color-mode", (gint) EDGEFIRST_COLOR_MODE_INSTANCE, NULL);
+  g_object_get (el, "color-mode", &e, NULL);
+  fail_unless_equals_int (e, EDGEFIRST_COLOR_MODE_INSTANCE);
+
+  gst_object_unref (el);
+}
+GST_END_TEST;
+
+/* ── TCase "OverlayTypes" ──────────────────────────────────────────── */
+
+GST_START_TEST (test_overlay_detection_types)
+{
+  GType box_type = edgefirst_detect_box_get_type ();
+  fail_unless (box_type != 0, "EdgeFirstDetectBox not registered");
+  fail_unless (G_TYPE_IS_BOXED (box_type));
+
+  GType seg_type = edgefirst_segmentation_get_type ();
+  fail_unless (seg_type != 0, "EdgeFirstSegmentation not registered");
+  fail_unless (G_TYPE_IS_BOXED (seg_type));
+
+  GType cm_type = edgefirst_color_mode_get_type ();
+  fail_unless (cm_type != 0, "EdgeFirstColorMode not registered");
+  fail_unless (G_TYPE_IS_ENUM (cm_type));
+
+  fail_unless (g_type_is_a (edgefirst_detect_box_list_get_type (), G_TYPE_OBJECT));
+  fail_unless (g_type_is_a (edgefirst_segmentation_list_get_type (), G_TYPE_OBJECT));
+}
+GST_END_TEST;
+
+/* ── TCase "Overlay" extra tests ───────────────────────────────────── */
+
+GST_START_TEST (test_overlay_new_detection_signal)
+{
+  /* Verify the new-detection signal exists with correct parameter types */
+  GstElement *el = gst_element_factory_make ("edgefirstoverlay", NULL);
+  fail_unless (el != NULL);
+
+  guint sig_id = g_signal_lookup ("new-detection", G_OBJECT_TYPE (el));
+  fail_unless (sig_id != 0, "new-detection signal not found");
+
+  GSignalQuery query;
+  g_signal_query (sig_id, &query);
+  fail_unless_equals_int (query.n_params, 2);
+  fail_unless (query.param_types[0] == EDGEFIRST_TYPE_DETECT_BOX_LIST,
+      "First param should be EDGEFIRST_TYPE_DETECT_BOX_LIST");
+  fail_unless (query.param_types[1] == EDGEFIRST_TYPE_SEGMENTATION_LIST,
+      "Second param should be EDGEFIRST_TYPE_SEGMENTATION_LIST");
+
+  gst_object_unref (el);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_overlay_no_decoder)
+{
+  GstElement *el;
+  GstStateChangeReturn ret;
+
+  el = gst_element_factory_make ("edgefirstoverlay", NULL);
+  fail_unless (el != NULL, "Failed to create edgefirstoverlay");
+
+  /* No model-config set — decoder will be auto-configured (or skipped).
+   * The element must reach READY state without error. */
+  ret = gst_element_set_state (el, GST_STATE_READY);
+  fail_unless (ret == GST_STATE_CHANGE_SUCCESS,
+      "NULL -> READY failed with %d", ret);
+
+  /* Verify state is actually READY */
+  GstState current, pending;
+  gst_element_get_state (el, &current, &pending, GST_CLOCK_TIME_NONE);
+  fail_unless_equals_int (current, GST_STATE_READY);
+
+  /* Back to NULL cleanly */
+  ret = gst_element_set_state (el, GST_STATE_NULL);
+  fail_unless (ret == GST_STATE_CHANGE_SUCCESS,
+      "READY -> NULL failed with %d", ret);
+
+  gst_object_unref (el);
+}
+GST_END_TEST;
+
+/* ── TCase "OverlayPipeline" ────────────────────────────────────────── */
+
+GST_START_TEST (test_overlay_model_sync_eos)
+{
+  /* With model-sync=true and no tensors arriving (fakesrc sends EOS immediately),
+   * EOS on video must not deadlock — the flushing flag unblocks the wait */
+  GstElement *pipeline = gst_parse_launch (
+      "videotestsrc num-buffers=2 ! video/x-raw,format=RGB,width=32,height=32 "
+      "! edgefirstoverlay model-sync=true model-sync-timeout=100 name=ov "
+      "! fakesink  "
+      "fakesrc num-buffers=0 format=3 "
+      "! other/tensors,format=static,num_tensors=1,types=(string)float32,"
+        "dimensions=(string)84:8400:1:1,framerate=0/1 "
+      "! ov.tensors",
+      NULL);
+  fail_unless (pipeline != NULL);
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  GstBus *bus = gst_element_get_bus (pipeline);
+  GstMessage *msg = gst_bus_timed_pop_filtered (bus, GST_SECOND * 5,
+      GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+
+  fail_unless (msg != NULL, "No EOS or ERROR within 5s — possible deadlock");
+  fail_unless (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_EOS,
+      "Expected EOS, got %s", gst_message_type_get_name (GST_MESSAGE_TYPE (msg)));
+
+  gst_message_unref (msg);
+  gst_object_unref (bus);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_overlay_caps_negotiation)
+{
+  /* Video sink accepts RGB; src pad output should be RGBA.
+   * fakesrc num-buffers=0 on tensors pad sends immediate EOS. */
+  GstElement *pipeline = gst_parse_launch (
+      "videotestsrc num-buffers=1 ! video/x-raw,format=RGB,width=64,height=64 "
+      "! edgefirstoverlay name=ov ! appsink name=sink caps=video/x-raw,format=RGBA  "
+      "fakesrc num-buffers=0 format=3 "
+      "! other/tensors,format=static,num_tensors=1,types=(string)float32,"
+        "dimensions=(string)84:8400:1:1,framerate=0/1 "
+      "! ov.tensors",
+      NULL);
+  fail_unless (pipeline != NULL);
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  GstBus *bus = gst_element_get_bus (pipeline);
+  GstMessage *msg = gst_bus_timed_pop_filtered (bus, GST_SECOND * 5,
+      GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+
+  fail_unless (msg != NULL);
+  fail_unless (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_EOS,
+      "Expected EOS, got %s", gst_message_type_get_name (GST_MESSAGE_TYPE (msg)));
+
+  gst_message_unref (msg);
+  gst_object_unref (bus);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_overlay_no_tensors)
+{
+  /* Verify element instantiates and transitions to PAUSED without crashing
+   * when model-config is NULL */
+  GstElement *el = gst_element_factory_make ("edgefirstoverlay", NULL);
+  fail_unless (el != NULL);
+  GstStateChangeReturn ret = gst_element_set_state (el, GST_STATE_PAUSED);
+  /* ASYNC is acceptable since pads are not connected */
+  fail_unless (ret != GST_STATE_CHANGE_FAILURE, "PAUSED transition failed");
+  gst_element_set_state (el, GST_STATE_NULL);
+  gst_object_unref (el);
+}
+GST_END_TEST;
+
+static GstFlowReturn
+overlay_repeat_last_new_sample_cb (GstAppSink *sink, gpointer user_data)
+{
+  gint *count = (gint *) user_data;
+  (*count)++;
+  GstSample *sample = gst_app_sink_pull_sample (sink);
+  if (sample) gst_sample_unref (sample);
+  return GST_FLOW_OK;
+}
+
+GST_START_TEST (test_overlay_repeat_last)
+{
+  /* N video frames in → N video frames out (pass-through with no model detections) */
+  GstElement *pipeline = gst_parse_launch (
+      "videotestsrc num-buffers=5 ! video/x-raw,format=RGB,width=32,height=32 "
+      "! edgefirstoverlay name=ov ! appsink name=sink  "
+      "fakesrc num-buffers=0 format=3 "
+      "! other/tensors,format=static,num_tensors=1,types=(string)float32,"
+        "dimensions=(string)84:8400:1:1,framerate=0/1 "
+      "! ov.tensors",
+      NULL);
+  fail_unless (pipeline != NULL);
+
+  gint count = 0;
+  GstElement *sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  g_object_set (sink, "emit-signals", TRUE, NULL);
+  g_signal_connect (sink, "new-sample",
+      G_CALLBACK (overlay_repeat_last_new_sample_cb), &count);
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  GstBus *bus = gst_element_get_bus (pipeline);
+  gst_bus_timed_pop_filtered (bus, 5 * GST_SECOND,
+      GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+  gst_object_unref (bus);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+
+  fail_unless (count == 5, "Expected 5 output frames, got %d", count);
+
+  gst_object_unref (sink);
+  gst_object_unref (pipeline);
+}
+GST_END_TEST;
+
+static GstFlowReturn
+overlay_model_sync_new_sample_cb (GstAppSink *sink, gpointer user_data)
+{
+  gint *count = (gint *) user_data;
+  (*count)++;
+  GstSample *sample = gst_app_sink_pull_sample (sink);
+  if (sample) gst_sample_unref (sample);
+  return GST_FLOW_OK;
+}
+
+GST_START_TEST (test_overlay_model_sync)
+{
+  /* model-sync=TRUE with timeout: all video frames should eventually be produced
+   * (tensors EOS sets flushing, allowing video to drain without hanging) */
+  GstElement *pipeline = gst_parse_launch (
+      "videotestsrc num-buffers=2 ! video/x-raw,format=RGB,width=32,height=32 "
+      "! edgefirstoverlay model-sync=true model-sync-timeout=100 name=ov "
+      "! appsink name=sink  "
+      "fakesrc num-buffers=0 format=3 "
+      "! other/tensors,format=static,num_tensors=1,types=(string)float32,"
+        "dimensions=(string)84:8400:1:1,framerate=0/1 "
+      "! ov.tensors",
+      NULL);
+  fail_unless (pipeline != NULL);
+
+  gint count = 0;
+  GstElement *sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  g_object_set (sink, "emit-signals", TRUE, NULL);
+  g_signal_connect (sink, "new-sample",
+      G_CALLBACK (overlay_model_sync_new_sample_cb), &count);
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  GstBus *bus = gst_element_get_bus (pipeline);
+  gst_bus_timed_pop_filtered (bus, 5 * GST_SECOND,
+      GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+  gst_object_unref (bus);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+
+  fail_unless (count == 2, "Expected 2 output frames with model-sync timeout, got %d", count);
+
+  gst_object_unref (sink);
+  gst_object_unref (pipeline);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_overlay_auto_config_detect)
+{
+  /* Auto-configure from YOLOv8-detect caps [84:8400:1:1] — no crash */
+  GstElement *el = gst_element_factory_make ("edgefirstoverlay", NULL);
+  fail_unless (el != NULL);
+  fail_unless (gst_element_set_state (el, GST_STATE_PAUSED) != GST_STATE_CHANGE_FAILURE);
+
+  GstPad *tpad = gst_element_get_static_pad (el, "tensors");
+  GstCaps *caps = gst_caps_from_string (
+      "other/tensors,num_tensors=(int)1,format=(string)static,"
+      "types=(string)float32,dimensions=(string)84:8400:1:1");
+  gst_pad_send_event (tpad, gst_event_new_caps (caps));
+  gst_caps_unref (caps);
+  gst_object_unref (tpad);
+
+  gst_element_set_state (el, GST_STATE_NULL);
+  gst_object_unref (el);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_overlay_auto_config_seg)
+{
+  /* Auto-configure from YOLOv8-seg caps (4 tensors) — no crash */
+  GstElement *el = gst_element_factory_make ("edgefirstoverlay", NULL);
+  fail_unless (el != NULL);
+  fail_unless (gst_element_set_state (el, GST_STATE_PAUSED) != GST_STATE_CHANGE_FAILURE);
+
+  GstPad *tpad = gst_element_get_static_pad (el, "tensors");
+  GstCaps *caps = gst_caps_from_string (
+      "other/tensors,num_tensors=(int)4,format=(string)static,"
+      "types=(string)\"float32,float32,float32,float32\","
+      "dimensions=(string)\"4:8400:1:1,80:8400:1:1,32:8400:1:1,32:160:160:1\"");
+  gst_pad_send_event (tpad, gst_event_new_caps (caps));
+  gst_caps_unref (caps);
+  gst_object_unref (tpad);
+
+  gst_element_set_state (el, GST_STATE_NULL);
+  gst_object_unref (el);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_overlay_segmentation_independence)
+{
+  /* edgefirst_detect_box_list_new(NULL) returns NULL — guarded in new() */
+  EdgeFirstDetectBoxList *box_list = edgefirst_detect_box_list_new (NULL);
+  fail_unless (box_list == NULL,
+      "edgefirst_detect_box_list_new(NULL) should return NULL");
+
+  /* Verify EdgeFirstSegmentation copy is independent of original */
+  EdgeFirstSegmentation *seg = g_slice_new (EdgeFirstSegmentation);
+  static const guint8 mask_data[4] = {128, 64, 192, 32};
+  seg->width  = 2;
+  seg->height = 2;
+  seg->mask   = g_bytes_new (mask_data, sizeof (mask_data));
+  seg->x1 = 0.1f; seg->y1 = 0.2f; seg->x2 = 0.8f; seg->y2 = 0.9f;
+
+  EdgeFirstSegmentation *copy = edgefirst_segmentation_copy (seg);
+  edgefirst_segmentation_free (seg);
+
+  gsize sz = 0;
+  const guint8 *data = g_bytes_get_data (copy->mask, &sz);
+  fail_unless (sz == 4);
+  fail_unless (data[0] == 128 && data[1] == 64);
+
+  edgefirst_segmentation_free (copy);
+}
+GST_END_TEST;
+
 /* ── Suite ─────────────────────────────────────────────────────────── */
 
 static Suite *
@@ -835,6 +1194,29 @@ edgefirst_hal_elements_suite (void)
   tcase_add_test (tc_formats, test_format_conversion_all_formats);
   tcase_add_test (tc_formats, test_format_timing);
   suite_add_tcase (s, tc_formats);
+
+  TCase *tc_overlay_el = tcase_create ("Overlay");
+  tcase_add_test (tc_overlay_el, test_overlay_create);
+  tcase_add_test (tc_overlay_el, test_overlay_properties);
+  tcase_add_test (tc_overlay_el, test_overlay_new_detection_signal);
+  tcase_add_test (tc_overlay_el, test_overlay_no_decoder);
+  tcase_add_test (tc_overlay_el, test_overlay_no_tensors);
+  tcase_add_test (tc_overlay_el, test_overlay_auto_config_detect);
+  tcase_add_test (tc_overlay_el, test_overlay_auto_config_seg);
+  tcase_add_test (tc_overlay_el, test_overlay_segmentation_independence);
+  suite_add_tcase (s, tc_overlay_el);
+
+  TCase *tc_overlay_pipeline = tcase_create ("OverlayPipeline");
+  tcase_set_timeout (tc_overlay_pipeline, 30);
+  tcase_add_test (tc_overlay_pipeline, test_overlay_model_sync_eos);
+  tcase_add_test (tc_overlay_pipeline, test_overlay_caps_negotiation);
+  tcase_add_test (tc_overlay_pipeline, test_overlay_repeat_last);
+  tcase_add_test (tc_overlay_pipeline, test_overlay_model_sync);
+  suite_add_tcase (s, tc_overlay_pipeline);
+
+  TCase *tc_overlay = tcase_create ("OverlayTypes");
+  tcase_add_test (tc_overlay, test_overlay_detection_types);
+  suite_add_tcase (s, tc_overlay);
 
   return s;
 }

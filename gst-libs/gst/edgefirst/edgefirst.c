@@ -34,6 +34,13 @@ edgefirst_perception_init (void)
   edgefirst_transform_meta_get_info ();
   edgefirst_camera_info_meta_get_info ();
 
+  /* Ensure detection GTypes are registered */
+  edgefirst_detect_box_get_type ();
+  edgefirst_detect_box_list_get_type ();
+  edgefirst_segmentation_get_type ();
+  edgefirst_segmentation_list_get_type ();
+  edgefirst_color_mode_get_type ();
+
   _initialized = TRUE;
 
   g_mutex_unlock (&_init_mutex);

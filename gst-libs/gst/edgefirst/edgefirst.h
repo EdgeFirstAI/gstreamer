@@ -13,6 +13,7 @@
 #include <gst/edgefirst/edgefirstradarcubemeta.h>
 #include <gst/edgefirst/edgefirsttransformmeta.h>
 #include <gst/edgefirst/edgefirstcamerainfometa.h>
+#include <gst/edgefirst/edgefirstdetection.h>
 
 G_BEGIN_DECLS
 

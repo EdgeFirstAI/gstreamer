@@ -3,12 +3,8 @@
  * Copyright (C) 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * GPU-accelerated segmentation mask + bounding box overlay renderer.
- * Accepts video input, converts to RGBA via HAL image processor, and
- * draws detection/segmentation results using hal_image_processor_draw_masks().
- *
- * The NN branch calls edgefirst_overlay_set_results() to provide the
- * latest inference results; the display thread reads them each frame.
+ * Dual-sink GstElement: accepts video + other/tensors, runs HAL 0.15.0
+ * decode->materialize->draw pipeline, emits new-detection signal.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -19,8 +15,42 @@
 
 #include <gst/video/video.h>
 #include <gst/allocators/gstdmabuf.h>
+#include <edgefirst/hal.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+
+/* hal_image_processor_draw_decoded_masks was added in HAL 0.15.0.
+ * Declare weak so the plugin still loads against older library versions;
+ * the video chain guards the call with a NULL check at runtime. */
+extern int hal_image_processor_draw_decoded_masks (struct hal_image_processor *processor,
+    struct hal_tensor *dst,
+    const struct hal_detect_box_list *detections,
+    const struct hal_segmentation_list *segmentations,
+    const struct hal_tensor *background,
+    float opacity,
+    const float *letterbox,
+    enum hal_color_mode color_mode) __attribute__((weak));
+
+/* hal_image_processor_materialize_masks was added in HAL 0.15.0.
+ * Declare weak so the plugin still loads against older library versions;
+ * the tensor chain guards the call with a NULL check at runtime. */
+extern struct hal_segmentation_list *hal_image_processor_materialize_masks (
+    struct hal_image_processor *processor,
+    const struct hal_detect_box_list *detections,
+    const struct hal_proto_data *proto,
+    const float *letterbox) __attribute__((weak));
+
+/* hal_decoder_decode_proto and hal_proto_data_free were added in HAL 0.15.0.
+ * Declare weak so the plugin still loads against older library versions;
+ * the tensor chain falls back to hal_decoder_decode when NULL at runtime. */
+extern struct hal_proto_data *hal_decoder_decode_proto (
+    const struct hal_decoder *decoder,
+    const struct hal_tensor *const *outputs,
+    size_t num_outputs,
+    struct hal_detect_box_list **out_boxes) __attribute__((weak));
+
+extern void hal_proto_data_free (struct hal_proto_data *proto) __attribute__((weak));
 
 GST_DEBUG_CATEGORY_STATIC (edgefirst_overlay_debug);
 #define GST_CAT_DEFAULT edgefirst_overlay_debug
@@ -29,82 +59,370 @@ GST_DEBUG_CATEGORY_STATIC (edgefirst_overlay_debug);
 
 enum {
   PROP_0,
+  PROP_MODEL_CONFIG,
+  PROP_SCORE_THRESHOLD,
+  PROP_IOU_THRESHOLD,
+  PROP_DECODER_VERSION,
+  PROP_MODEL_WIDTH,
+  PROP_MODEL_HEIGHT,
+  PROP_MODEL_SYNC,
+  PROP_MODEL_SYNC_TIMEOUT,
+  PROP_LETTERBOX,
+  PROP_OPACITY,
+  PROP_COLOR_MODE,
   PROP_CLASS_COLORS,
 };
+
+/* ── Signal IDs ──────────────────────────────────────────────────── */
+
+enum {
+  SIGNAL_NEW_DETECTION,
+  N_SIGNALS,
+};
+static guint signals[N_SIGNALS];
 
 /* ── Instance struct ─────────────────────────────────────────────── */
 
 struct _EdgefirstOverlay {
-  GstBaseTransform parent;
+  GstElement parent;
+
+  /* Fixed pads */
+  GstPad *video_sinkpad;
+  GstPad *tensors_sinkpad;
+  GstPad *srcpad;
 
   /* HAL state */
-  hal_image_processor *processor;
-  hal_tensor *display_image;         /* Persistent RGBA at display resolution */
+  hal_image_processor   *processor;
+  hal_decoder           *decoder;
+  hal_tensor            *display_image;   /* persistent RGBA render target */
+  gboolean               display_is_dmabuf;
+  GstAllocator          *dmabuf_allocator;
 
-  /* Input video info */
-  GstVideoInfo in_info;
-  gboolean in_info_valid;
-  enum hal_pixel_format src_pixel_format;
+  /* Video info */
+  GstVideoInfo           in_info;
+  gboolean               in_info_valid;
+  enum hal_pixel_format  src_pixel_format;
+  guint                  display_w, display_h;
 
-  /* Thread-safe result storage (NN thread writes, display thread reads) */
-  GMutex lock;
-  hal_detect_box_list *boxes;
-  hal_segmentation_list *segmentations;
+  /* Thread-safe decoded state */
+  GMutex                 lock;
+  GCond                  decode_cond;
+  EdgeFirstDetectBoxList    *boxes_obj;       /* NULL until first tensor */
+  EdgeFirstSegmentationList *segs_obj;        /* NULL for det-only models */
+  GstClockTime           decode_ts;
+  gboolean               flushing;
+  gboolean               normalized;         /* TRUE if decoder outputs [0,1] coords */
+
+  /* Cached tensor shapes from CAPS event (for chain function) */
+  size_t   tensor_ndims[16];
+  size_t   tensor_shapes[16][8];
+  gint     tensor_count;
+  enum hal_dtype tensor_dtypes[16];
 
   /* Properties */
-  gchar *class_colors;
+  gchar     *model_config;
+  gfloat     score_threshold;
+  gfloat     iou_threshold;
+  gchar     *decoder_version;
+  guint      model_width;
+  guint      model_height;
+  gboolean   model_sync;
+  guint      model_sync_timeout_ms;
+  gchar     *letterbox_str;
+  gboolean   has_letterbox;
+  gfloat     letterbox[4];
+  gfloat     opacity;
+  EdgeFirstColorMode color_mode;
+  gchar     *class_colors;
 };
 
 /* ── Pad templates ───────────────────────────────────────────────── */
 
-static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
-    GST_PAD_SINK,
-    GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (
-      "video/x-raw(memory:DMABuf), "
-        "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
-        "width=[1,MAX], height=[1,MAX]; "
-      "video/x-raw, "
-        "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
-        "width=[1,MAX], height=[1,MAX]"
-    ));
+static GstStaticPadTemplate video_sink_template =
+    GST_STATIC_PAD_TEMPLATE ("video",
+        GST_PAD_SINK, GST_PAD_ALWAYS,
+        GST_STATIC_CAPS (
+            "video/x-raw(memory:DMABuf), "
+                "format={NV12,YUY2,RGB,RGBA,GRAY8}, width=[1,MAX], height=[1,MAX]; "
+            "video/x-raw, "
+                "format={NV12,YUY2,RGB,RGBA,GRAY8}, width=[1,MAX], height=[1,MAX]"));
 
-static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
-    GST_PAD_SRC,
-    GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (
-      "video/x-raw, format=RGBA, width=[1,MAX], height=[1,MAX]"
-    ));
+static GstStaticPadTemplate tensors_sink_template =
+    GST_STATIC_PAD_TEMPLATE ("tensors",
+        GST_PAD_SINK, GST_PAD_ALWAYS,
+        GST_STATIC_CAPS ("other/tensors"));
+
+static GstStaticPadTemplate src_template =
+    GST_STATIC_PAD_TEMPLATE ("src",
+        GST_PAD_SRC, GST_PAD_ALWAYS,
+        GST_STATIC_CAPS (
+            "video/x-raw(memory:DMABuf), format=RGBA, width=[1,MAX], height=[1,MAX]; "
+            "video/x-raw, format=RGBA, width=[1,MAX], height=[1,MAX]"));
 
 /* ── Type definition ─────────────────────────────────────────────── */
 
 #define edgefirst_overlay_parent_class parent_class
-G_DEFINE_TYPE (EdgefirstOverlay, edgefirst_overlay, GST_TYPE_BASE_TRANSFORM);
+G_DEFINE_TYPE (EdgefirstOverlay, edgefirst_overlay, GST_TYPE_ELEMENT)
 
-/* ── Forward declarations ────────────────────────────────────────── */
+/* Forward declarations */
+static void            edgefirst_overlay_finalize    (GObject *);
+static void            edgefirst_overlay_set_property (GObject *, guint, const GValue *, GParamSpec *);
+static void            edgefirst_overlay_get_property (GObject *, guint, GValue *, GParamSpec *);
+static GstStateChangeReturn edgefirst_overlay_change_state (GstElement *, GstStateChange);
+static GstFlowReturn   edgefirst_overlay_video_chain   (GstPad *, GstObject *, GstBuffer *);
+static GstFlowReturn   edgefirst_overlay_tensors_chain (GstPad *, GstObject *, GstBuffer *);
+static gboolean        edgefirst_overlay_video_event   (GstPad *, GstObject *, GstEvent *);
+static gboolean        edgefirst_overlay_tensors_event (GstPad *, GstObject *, GstEvent *);
+static gboolean        edgefirst_overlay_src_query     (GstPad *, GstObject *, GstQuery *);
 
-static void edgefirst_overlay_set_property (GObject *, guint,
-    const GValue *, GParamSpec *);
-static void edgefirst_overlay_get_property (GObject *, guint,
-    GValue *, GParamSpec *);
-static void edgefirst_overlay_finalize (GObject *);
-static gboolean edgefirst_overlay_start (GstBaseTransform *);
-static gboolean edgefirst_overlay_stop (GstBaseTransform *);
-static GstCaps *edgefirst_overlay_transform_caps (GstBaseTransform *,
-    GstPadDirection, GstCaps *, GstCaps *);
-static gboolean edgefirst_overlay_set_caps (GstBaseTransform *,
-    GstCaps *, GstCaps *);
-static gboolean edgefirst_overlay_transform_size (GstBaseTransform *,
-    GstPadDirection, GstCaps *, gsize, GstCaps *, gsize *);
-static gboolean edgefirst_overlay_decide_allocation (GstBaseTransform *,
-    GstQuery *);
-static GstFlowReturn edgefirst_overlay_prepare_output_buffer (
-    GstBaseTransform *, GstBuffer *, GstBuffer **);
-static GstFlowReturn edgefirst_overlay_transform (GstBaseTransform *,
-    GstBuffer *, GstBuffer *);
+static void
+edgefirst_overlay_class_init (EdgefirstOverlayClass *klass)
+{
+  GObjectClass    *obj_class = G_OBJECT_CLASS (klass);
+  GstElementClass *el_class  = GST_ELEMENT_CLASS (klass);
 
-/* ── Helpers ─────────────────────────────────────────────────────── */
+  GST_DEBUG_CATEGORY_INIT (edgefirst_overlay_debug, "edgefirstoverlay", 0,
+      "EdgeFirst Overlay");
 
+  obj_class->finalize     = edgefirst_overlay_finalize;
+  obj_class->set_property = edgefirst_overlay_set_property;
+  obj_class->get_property = edgefirst_overlay_get_property;
+  el_class->change_state  = edgefirst_overlay_change_state;
+
+  /* Properties */
+  g_object_class_install_property (obj_class, PROP_MODEL_CONFIG,
+      g_param_spec_string ("model-config", "Model Config",
+          "Path to edgefirst.yaml/.json or inline JSON. NULL = auto-configure from tensor caps.",
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_SCORE_THRESHOLD,
+      g_param_spec_float ("score-threshold", "Score Threshold",
+          "NMS score threshold", 0.0f, 1.0f, 0.25f,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_IOU_THRESHOLD,
+      g_param_spec_float ("iou-threshold", "IoU Threshold",
+          "NMS IoU threshold for duplicate suppression", 0.0f, 1.0f, 0.45f,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_DECODER_VERSION,
+      g_param_spec_string ("decoder-version", "Decoder Version",
+          "YOLO version for auto-config: yolov5, yolov8, yolo11, yolo26",
+          "yolov8", G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_MODEL_WIDTH,
+      g_param_spec_uint ("model-width", "Model Width",
+          "Model input width (0 = infer from tensor caps)", 0, G_MAXUINT, 0,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_MODEL_HEIGHT,
+      g_param_spec_uint ("model-height", "Model Height",
+          "Model input height (0 = infer from tensor caps)", 0, G_MAXUINT, 0,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_MODEL_SYNC,
+      g_param_spec_boolean ("model-sync", "Model Sync",
+          "Wait for matching tensor timestamp before drawing (B mode)",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_MODEL_SYNC_TIMEOUT,
+      g_param_spec_uint ("model-sync-timeout", "Model Sync Timeout",
+          "Max ms to wait in model-sync mode (0 = wait indefinitely)",
+          0, G_MAXUINT, 500,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_LETTERBOX,
+      g_param_spec_string ("letterbox", "Letterbox",
+          "Normalized letterbox rect \"x0,y0,x1,y1\" (NULL = no correction)",
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_OPACITY,
+      g_param_spec_float ("opacity", "Opacity",
+          "Mask opacity [0.0-1.0]", 0.0f, 1.0f, 0.6f,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_COLOR_MODE,
+      g_param_spec_enum ("color-mode", "Color Mode",
+          "How to assign colors to detections",
+          EDGEFIRST_TYPE_COLOR_MODE, EDGEFIRST_COLOR_MODE_CLASS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_CLASS_COLORS,
+      g_param_spec_string ("class-colors", "Class Colors",
+          "Comma-separated RGBA hex values per class, e.g. \"FF0000FF,00FF00FF\"",
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* new-detection signal */
+  signals[SIGNAL_NEW_DETECTION] = g_signal_new ("new-detection",
+      G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST,
+      0, NULL, NULL, NULL,
+      G_TYPE_NONE, 2,
+      EDGEFIRST_TYPE_DETECT_BOX_LIST,
+      EDGEFIRST_TYPE_SEGMENTATION_LIST);
+
+  gst_element_class_set_static_metadata (el_class,
+      "EdgeFirst Overlay", "Filter/Video",
+      "GPU-accelerated detection/segmentation overlay with dual-pad input",
+      "Au-Zone Technologies <info@au-zone.com>");
+
+  gst_element_class_add_static_pad_template (el_class, &video_sink_template);
+  gst_element_class_add_static_pad_template (el_class, &tensors_sink_template);
+  gst_element_class_add_static_pad_template (el_class, &src_template);
+}
+
+static void
+edgefirst_overlay_init (EdgefirstOverlay *self)
+{
+  /* Create pads */
+  self->video_sinkpad = gst_pad_new_from_static_template (&video_sink_template, "video");
+  gst_pad_set_chain_function (self->video_sinkpad, edgefirst_overlay_video_chain);
+  gst_pad_set_event_function (self->video_sinkpad, edgefirst_overlay_video_event);
+  gst_element_add_pad (GST_ELEMENT (self), self->video_sinkpad);
+
+  self->tensors_sinkpad = gst_pad_new_from_static_template (&tensors_sink_template, "tensors");
+  gst_pad_set_chain_function (self->tensors_sinkpad, edgefirst_overlay_tensors_chain);
+  gst_pad_set_event_function (self->tensors_sinkpad, edgefirst_overlay_tensors_event);
+  gst_element_add_pad (GST_ELEMENT (self), self->tensors_sinkpad);
+
+  self->srcpad = gst_pad_new_from_static_template (&src_template, "src");
+  gst_pad_set_query_function (self->srcpad, edgefirst_overlay_src_query);
+  gst_element_add_pad (GST_ELEMENT (self), self->srcpad);
+
+  /* Default property values */
+  self->score_threshold       = 0.25f;
+  self->iou_threshold         = 0.45f;
+  self->decoder_version       = g_strdup ("yolov8");
+  self->model_sync_timeout_ms = 500;
+  self->opacity               = 0.6f;
+  self->color_mode            = EDGEFIRST_COLOR_MODE_CLASS;
+  self->decode_ts             = GST_CLOCK_TIME_NONE;
+  self->dmabuf_allocator      = gst_dmabuf_allocator_new ();
+}
+
+/* ── finalize, set_property, get_property ────────────────────────── */
+
+static void
+edgefirst_overlay_finalize (GObject *object)
+{
+  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (object);
+
+  g_free (self->model_config);
+  g_free (self->decoder_version);
+  g_free (self->letterbox_str);
+  g_free (self->class_colors);
+  gst_object_unref (self->dmabuf_allocator);
+
+  /* HAL and GObjects freed in stop(); clear in case finalize is called early */
+  g_clear_object (&self->boxes_obj);
+  g_clear_object (&self->segs_obj);
+
+  G_OBJECT_CLASS (parent_class)->finalize (object);
+}
+
+static void
+edgefirst_overlay_set_property (GObject *object, guint prop_id,
+    const GValue *value, GParamSpec *pspec)
+{
+  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (object);
+
+  switch (prop_id) {
+    case PROP_MODEL_CONFIG:
+      g_free (self->model_config);
+      self->model_config = g_value_dup_string (value);
+      break;
+    case PROP_SCORE_THRESHOLD:
+      self->score_threshold = g_value_get_float (value);
+      break;
+    case PROP_IOU_THRESHOLD:
+      self->iou_threshold = g_value_get_float (value);
+      break;
+    case PROP_DECODER_VERSION:
+      g_free (self->decoder_version);
+      self->decoder_version = g_value_dup_string (value);
+      break;
+    case PROP_MODEL_WIDTH:
+      self->model_width = g_value_get_uint (value);
+      break;
+    case PROP_MODEL_HEIGHT:
+      self->model_height = g_value_get_uint (value);
+      break;
+    case PROP_MODEL_SYNC:
+      self->model_sync = g_value_get_boolean (value);
+      break;
+    case PROP_MODEL_SYNC_TIMEOUT:
+      self->model_sync_timeout_ms = g_value_get_uint (value);
+      break;
+    case PROP_LETTERBOX:
+      g_free (self->letterbox_str);
+      self->letterbox_str = g_value_dup_string (value);
+      self->has_letterbox = FALSE;
+      if (self->letterbox_str) {
+        gint n = sscanf (self->letterbox_str, "%f,%f,%f,%f",
+            &self->letterbox[0], &self->letterbox[1],
+            &self->letterbox[2], &self->letterbox[3]);
+        self->has_letterbox = (n == 4);
+        if (!self->has_letterbox)
+          GST_WARNING_OBJECT (self, "Invalid letterbox string: %s",
+              self->letterbox_str);
+      }
+      break;
+    case PROP_OPACITY:
+      self->opacity = g_value_get_float (value);
+      break;
+    case PROP_COLOR_MODE:
+      self->color_mode = (EdgeFirstColorMode) g_value_get_enum (value);
+      break;
+    case PROP_CLASS_COLORS:
+      g_free (self->class_colors);
+      self->class_colors = g_value_dup_string (value);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+  }
+}
+
+static void
+edgefirst_overlay_get_property (GObject *object, guint prop_id,
+    GValue *value, GParamSpec *pspec)
+{
+  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (object);
+
+  switch (prop_id) {
+    case PROP_MODEL_CONFIG:       g_value_set_string  (value, self->model_config);        break;
+    case PROP_SCORE_THRESHOLD:    g_value_set_float   (value, self->score_threshold);     break;
+    case PROP_IOU_THRESHOLD:      g_value_set_float   (value, self->iou_threshold);       break;
+    case PROP_DECODER_VERSION:    g_value_set_string  (value, self->decoder_version);     break;
+    case PROP_MODEL_WIDTH:        g_value_set_uint    (value, self->model_width);         break;
+    case PROP_MODEL_HEIGHT:       g_value_set_uint    (value, self->model_height);        break;
+    case PROP_MODEL_SYNC:         g_value_set_boolean (value, self->model_sync);          break;
+    case PROP_MODEL_SYNC_TIMEOUT: g_value_set_uint    (value, self->model_sync_timeout_ms); break;
+    case PROP_LETTERBOX:          g_value_set_string  (value, self->letterbox_str);       break;
+    case PROP_OPACITY:            g_value_set_float   (value, self->opacity);             break;
+    case PROP_COLOR_MODE:         g_value_set_enum    (value, (gint) self->color_mode);   break;
+    case PROP_CLASS_COLORS:       g_value_set_string  (value, self->class_colors);        break;
+    default: G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec); break;
+  }
+}
+
+/* ── start / stop ────────────────────────────────────────────────── */
+
+/* Map "yolov8" string property to HalDecoderVersion enum */
+static enum HalDecoderVersion
+parse_decoder_version (const gchar *str)
+{
+  if (!str || g_ascii_strcasecmp (str, "yolov8") == 0)
+    return HAL_DECODER_VERSION_YOLOV8;
+  if (g_ascii_strcasecmp (str, "yolo11") == 0)
+    return HAL_DECODER_VERSION_YOLO11;
+  if (g_ascii_strcasecmp (str, "yolov5") == 0)
+    return HAL_DECODER_VERSION_YOLOV5;
+  if (g_ascii_strcasecmp (str, "yolo26") == 0)
+    return HAL_DECODER_VERSION_YOLO26;
+  return HAL_DECODER_VERSION_YOLOV8;
+}
+
+/* Map GstVideoFormat to HAL pixel format */
 static enum hal_pixel_format
 gst_format_to_hal (GstVideoFormat fmt)
 {
@@ -118,21 +436,321 @@ gst_format_to_hal (GstVideoFormat fmt)
   }
 }
 
-/**
- * Create a HAL image tensor from a GstBuffer.
- * Handles DMA-BUF zero-copy (via hal_import_image) and
- * system-memory (allocate via hal_image_processor_create_image + copy) paths.
- * Returns a newly-allocated tensor (caller must free).
- */
+static gboolean
+overlay_start (EdgefirstOverlay *self)
+{
+  self->processor = hal_image_processor_new ();
+  if (!self->processor) {
+    GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
+        ("Failed to create HAL image processor: %s", strerror (errno)), (NULL));
+    return FALSE;
+  }
+
+  if (self->model_config) {
+    struct hal_decoder_params *params = hal_decoder_params_new ();
+    if (g_file_test (self->model_config, G_FILE_TEST_EXISTS))
+      hal_decoder_params_set_config_file (params, self->model_config);
+    else
+      hal_decoder_params_set_config_json (params, self->model_config, 0);
+    hal_decoder_params_set_score_threshold (params, self->score_threshold);
+    hal_decoder_params_set_iou_threshold (params, self->iou_threshold);
+
+    self->decoder = hal_decoder_new (params);
+    hal_decoder_params_free (params);
+
+    if (!self->decoder) {
+      GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
+          ("Failed to create HAL decoder from config \"%s\": %s",
+           self->model_config, strerror (errno)), (NULL));
+      hal_image_processor_free (self->processor);
+      self->processor = NULL;
+      return FALSE;
+    }
+    self->normalized = hal_decoder_normalized_boxes (self->decoder);
+  } else {
+    self->decoder   = NULL;   /* deferred: auto-configure on tensors CAPS */
+    self->normalized = TRUE;
+  }
+
+  g_mutex_init (&self->lock);
+  g_cond_init (&self->decode_cond);
+  self->flushing  = FALSE;
+  self->decode_ts = GST_CLOCK_TIME_NONE;
+
+  return TRUE;
+}
+
+static void
+overlay_stop (EdgefirstOverlay *self)
+{
+  g_mutex_lock (&self->lock);
+  self->flushing = TRUE;
+  g_cond_broadcast (&self->decode_cond);
+  g_mutex_unlock (&self->lock);
+
+  hal_decoder_free (self->decoder);
+  self->decoder = NULL;
+  self->tensor_count = 0;
+
+  hal_image_processor_free (self->processor);
+  self->processor = NULL;
+
+  hal_tensor_free (self->display_image);
+  self->display_image = NULL;
+
+  g_mutex_lock (&self->lock);
+  g_clear_object (&self->boxes_obj);
+  g_clear_object (&self->segs_obj);
+  g_mutex_unlock (&self->lock);
+
+  g_mutex_clear (&self->lock);
+  g_cond_clear (&self->decode_cond);
+}
+
+static GstStateChangeReturn
+edgefirst_overlay_change_state (GstElement *element, GstStateChange transition)
+{
+  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (element);
+  GstStateChangeReturn ret;
+
+  switch (transition) {
+    case GST_STATE_CHANGE_READY_TO_PAUSED:
+      if (!overlay_start (self))
+        return GST_STATE_CHANGE_FAILURE;
+      break;
+    default:
+      break;
+  }
+
+  ret = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
+
+  switch (transition) {
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+      overlay_stop (self);
+      break;
+    default:
+      break;
+  }
+
+  return ret;
+}
+
+/* ── auto_config_decoder (tensors CAPS handler helper) ───────────── */
+
+/* Parse NNStreamer tensor dtype string to HAL dtype */
+static enum hal_dtype
+nnstreamer_type_to_hal (const gchar *type_str)
+{
+  if (!type_str) return HAL_DTYPE_F32;
+  if (g_strcmp0 (type_str, "float32") == 0) return HAL_DTYPE_F32;
+  if (g_strcmp0 (type_str, "uint8")   == 0) return HAL_DTYPE_U8;
+  if (g_strcmp0 (type_str, "int8")    == 0) return HAL_DTYPE_I8;
+  if (g_strcmp0 (type_str, "int16")   == 0) return HAL_DTYPE_I16;
+  if (g_strcmp0 (type_str, "int32")   == 0) return HAL_DTYPE_I32;
+  return HAL_DTYPE_F32;
+}
+
+/* Parse NNStreamer dim string "C:W:H:1" (innermost first) to shape[] (row-major).
+ * Returns ndim, fills shape[0..ndim-1] in row-major order (outermost first). */
+static size_t
+parse_nnstreamer_dims (const gchar *dim_str, size_t *shape, size_t max_ndim)
+{
+  gchar **parts = g_strsplit (dim_str, ":", (gint) max_ndim + 1);
+  size_t n = 0;
+  while (parts[n] && n < max_ndim) n++;
+  /* Strip trailing :1 dimensions */
+  while (n > 1 && g_strcmp0 (parts[n - 1], "1") == 0) n--;
+  /* NNStreamer: innermost first → reverse to row-major */
+  for (size_t i = 0; i < n; i++)
+    shape[i] = (size_t) g_ascii_strtoull (parts[n - 1 - i], NULL, 10);
+  g_strfreev (parts);
+  return n;
+}
+
+static gboolean
+overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
+{
+  GstStructure *s = gst_caps_get_structure (caps, 0);
+  gint num_tensors = 0;
+  const gchar *dims_str = NULL, *types_str = NULL;
+
+  if (!gst_structure_get_int (s, "num_tensors", &num_tensors) || num_tensors <= 0)
+    return FALSE;
+
+  dims_str  = gst_structure_get_string (s, "dimensions");
+  types_str = gst_structure_get_string (s, "types");
+
+  if (!dims_str || !types_str)
+    return FALSE;
+
+  gchar **dim_parts  = g_strsplit (dims_str,  ",", num_tensors + 1);
+  gchar **type_parts = g_strsplit (types_str, ",", num_tensors + 1);
+
+#define MAX_NDIM 8
+  /* ── Pass 1: detect flags ────────────────────────────────────── */
+  gboolean has_protos      = FALSE;
+  size_t   proto_channels  = 0;
+  gboolean has_split_boxes = FALSE;
+  size_t shapes[16][MAX_NDIM];
+  size_t ndims[16];
+
+  for (gint i = 0; i < num_tensors && i < 16; i++) {
+    ndims[i] = parse_nnstreamer_dims (dim_parts[i], shapes[i], MAX_NDIM);
+    if (ndims[i] == 3) {
+      has_protos = TRUE;
+      /* NNStreamer "C:W:H:1" → strip :1 → row-major [H,W,C]: channels = shapes[i][2] */
+      proto_channels = shapes[i][2];
+    } else if (ndims[i] >= 2) {
+      size_t feat_dim = shapes[i][1];  /* row-major: [batch, features, boxes] */
+      if (feat_dim == 4)
+        has_split_boxes = TRUE;
+    }
+  }
+
+  /* Cache shapes for tensors_chain */
+  self->tensor_count = (num_tensors < 16) ? num_tensors : 16;
+  for (gint i = 0; i < self->tensor_count; i++) {
+    self->tensor_ndims[i] = ndims[i];
+    self->tensor_dtypes[i] = nnstreamer_type_to_hal (type_parts[i]);
+    for (size_t j = 0; j < ndims[i] && j < 8; j++)
+      self->tensor_shapes[i][j] = shapes[i][j];
+  }
+
+  /* ── Pass 2: build decoder params ───────────────────────────── */
+  struct hal_decoder_params *params = hal_decoder_params_new ();
+  hal_decoder_params_set_score_threshold (params, self->score_threshold);
+  hal_decoder_params_set_iou_threshold   (params, self->iou_threshold);
+  hal_decoder_params_set_decoder_version (params, parse_decoder_version (self->decoder_version));
+
+  for (gint i = 0; i < num_tensors && i < 16; i++) {
+    size_t *shape  = shapes[i];
+    size_t  ndim   = ndims[i];
+    enum hal_dtype dtype = nnstreamer_type_to_hal (type_parts[i]);
+
+    enum HalOutputType  type;
+    enum HalDimName     dims[MAX_NDIM];
+
+    if (ndim == 3) {
+      /* NNStreamer "C:W:H:1" → strip :1 → row-major [H,W,C], ndim=3 */
+      type    = HAL_OUTPUT_TYPE_PROTOS;
+      dims[0] = HAL_DIM_NAME_HEIGHT;
+      dims[1] = HAL_DIM_NAME_WIDTH;
+      dims[2] = HAL_DIM_NAME_NUM_PROTOS;
+    } else if (has_split_boxes) {
+      size_t feat_dim = shape[1];
+      if (feat_dim == 4) {
+        type    = HAL_OUTPUT_TYPE_BOXES;
+        dims[0] = HAL_DIM_NAME_BATCH;
+        dims[1] = HAL_DIM_NAME_BOX_COORDS;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+        ndim    = 3;
+      } else if (has_protos && proto_channels > 0 && feat_dim == proto_channels) {
+        type    = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
+        dims[0] = HAL_DIM_NAME_BATCH;
+        dims[1] = HAL_DIM_NAME_NUM_PROTOS;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+        ndim    = 3;
+      } else {
+        type    = HAL_OUTPUT_TYPE_SCORES;
+        dims[0] = HAL_DIM_NAME_BATCH;
+        dims[1] = HAL_DIM_NAME_NUM_CLASSES;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+        ndim    = 3;
+      }
+    } else {
+      type    = HAL_OUTPUT_TYPE_DETECTION;
+      if (ndim >= 3) {
+        /* shape [batch, boxes, features] */
+        dims[0] = HAL_DIM_NAME_BATCH;
+        dims[1] = HAL_DIM_NAME_NUM_BOXES;
+        dims[2] = HAL_DIM_NAME_NUM_FEATURES;
+        ndim    = 3;
+      } else {
+        /* batch stripped: shape [boxes, features] */
+        dims[0] = HAL_DIM_NAME_NUM_BOXES;
+        dims[1] = HAL_DIM_NAME_NUM_FEATURES;
+        /* ndim stays as-is (2) */
+      }
+    }
+
+    gint idx = hal_decoder_params_add_output (params, type,
+        HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, ndim);
+
+    if (dtype != HAL_DTYPE_F32 && idx >= 0) {
+      hal_decoder_params_output_set_quantization (params, idx, 1.0f, 0);
+    }
+  }
+
+  g_strfreev (dim_parts);
+  g_strfreev (type_parts);
+
+  self->decoder = hal_decoder_new (params);
+  hal_decoder_params_free (params);
+
+  if (!self->decoder) {
+    GST_WARNING_OBJECT (self,
+        "auto-config decoder creation failed (%s); running in pass-through mode",
+        strerror (errno));
+    return TRUE;  /* not fatal */
+  }
+
+  self->normalized = hal_decoder_normalized_boxes (self->decoder);
+  GST_INFO_OBJECT (self, "auto-configured decoder from tensor caps "
+      "(%d tensors, has_split=%d, has_protos=%d)",
+      num_tensors, has_split_boxes, has_protos);
+  return TRUE;
+}
+
+/* ── Helper: parse_class_colors ──────────────────────────────────── */
+
+/* Parse comma-separated RGBA hex color values into uint8_t arrays.
+ * E.g. "FF0000FF,00FF00FF" → {{255,0,0,255}, {0,255,0,255}, ...}
+ * Returns number of colors parsed. Caller must g_free the output. */
+static gsize
+parse_class_colors (const gchar *str, uint8_t (**out_colors)[4])
+{
+  *out_colors = NULL;
+  if (!str || str[0] == '\0')
+    return 0;
+
+  gchar **parts = g_strsplit (str, ",", -1);
+  guint n = g_strv_length (parts);
+
+  uint8_t (*colors)[4] = g_malloc (n * sizeof (*colors));
+  gsize count = 0;
+
+  for (guint i = 0; i < n; i++) {
+    gchar *s = g_strstrip (parts[i]);
+    if (strlen (s) != 8)
+      continue;
+    guint32 val = (guint32) g_ascii_strtoull (s, NULL, 16);
+    colors[count][0] = (val >> 24) & 0xFF;
+    colors[count][1] = (val >> 16) & 0xFF;
+    colors[count][2] = (val >>  8) & 0xFF;
+    colors[count][3] = (val      ) & 0xFF;
+    count++;
+  }
+
+  g_strfreev (parts);
+  *out_colors = colors;
+  return count;
+}
+
+/* ── Helper: create_input_image ──────────────────────────────────── */
+
+/* Create a HAL input tensor from a GstBuffer.
+ * Tries DMABuf zero-copy via hal_import_image first; falls back to
+ * hal_image_processor_create_image + memcpy.
+ * Returns a new hal_tensor that the caller must free with hal_tensor_free(). */
 static hal_tensor *
 create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
 {
   GstVideoInfo *info = &self->in_info;
-  guint width = GST_VIDEO_INFO_WIDTH (info);
-  guint height = GST_VIDEO_INFO_HEIGHT (info);
+  guint width  = (guint) self->display_w;
+  guint height = (guint) self->display_h;
   enum hal_pixel_format pixel_fmt = self->src_pixel_format;
 
-  /* Determine row_bytes for packed copy fallback */
+  /* Determine packed row_bytes for memcpy fallback */
   size_t row_bytes;
   switch (pixel_fmt) {
     case HAL_PIXEL_FORMAT_RGB:   row_bytes = width * 3; break;
@@ -170,7 +788,7 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
 
       /* hal_import_image CONSUMES pd and chroma */
       hal_tensor *t = hal_import_image (self->processor,
-          pd, chroma, width, height, pixel_fmt, HAL_DTYPE_U8);
+          pd, chroma, (size_t) width, (size_t) height, pixel_fmt, HAL_DTYPE_U8);
       if (t)
         return t;
 
@@ -178,31 +796,30 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
     }
   }
 
-  /* Memcpy fallback: either the input buffer is not DMA-BUF or
-   * hal_import_image failed.  Warn once so pipeline operators can
-   * identify zero-copy regressions; subsequent occurrences at trace. */
+  /* Memcpy fallback: warn once so pipeline operators can identify
+   * zero-copy regressions; subsequent occurrences at trace level. */
   static gboolean memcpy_warned = FALSE;
   if (G_UNLIKELY (!memcpy_warned)) {
     memcpy_warned = TRUE;
-    GST_WARNING_OBJECT (self, "memcpy fallback active — input buffer is not "
-        "DMA-BUF or hal_import_image failed. Zero-copy is broken.");
+    GST_INFO_OBJECT (self, "Input is not DMABuf or hal_import_image failed; "
+        "using memcpy path");
   } else {
     GST_LOG_OBJECT (self, "memcpy fallback: copying input frame");
   }
 
   /* System-memory path: allocate HAL image and copy frame data into it */
   hal_tensor *tensor = hal_image_processor_create_image (self->processor,
-      width, height, pixel_fmt, HAL_DTYPE_U8);
+      (size_t) width, (size_t) height, pixel_fmt, HAL_DTYPE_U8);
   if (!tensor)
     return NULL;
 
-  hal_tensor_map *tmap = hal_tensor_map_create (tensor);
+  struct hal_tensor_map *tmap = hal_tensor_map_create (tensor);
   if (!tmap) {
     hal_tensor_free (tensor);
     return NULL;
   }
 
-  uint8_t *dst = hal_tensor_map_data (tmap);
+  uint8_t *dst = (uint8_t *) hal_tensor_map_data (tmap);
 
   GstVideoFrame frame;
   if (!gst_video_frame_map (&frame, info, inbuf, GST_MAP_READ)) {
@@ -213,18 +830,18 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
 
   if (pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
     /* Y plane */
-    const guint8 *y_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    const guint8 *y_data = (const guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
     gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
     for (guint y = 0; y < height; y++)
       memcpy (dst + y * width, y_data + y * y_stride, width);
     /* UV plane */
-    const guint8 *uv_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 1);
+    const guint8 *uv_data = (const guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&frame, 1);
     gint uv_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 1);
     uint8_t *uv_dst = dst + height * width;
     for (guint y = 0; y < height / 2; y++)
       memcpy (uv_dst + y * width, uv_data + y * uv_stride, width);
   } else {
-    const guint8 *src_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    const guint8 *src_data = (const guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
     gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
     if ((gsize) stride == row_bytes) {
       memcpy (dst, src_data, row_bytes * height);
@@ -236,119 +853,31 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
 
   gst_video_frame_unmap (&frame);
   hal_tensor_map_unmap (tmap);
-
   return tensor;
 }
 
-/**
- * Parse comma-separated RGBA hex color values into uint8_t arrays.
- * E.g. "FF0000FF,00FF00FF,0000FFFF" → {{255,0,0,255}, {0,255,0,255}, ...}
- * Returns number of colors parsed.  Caller must g_free the output.
- */
-static gsize
-parse_class_colors (const gchar *str, uint8_t (**out_colors)[4])
-{
-  *out_colors = NULL;
-  if (!str || str[0] == '\0')
-    return 0;
-
-  gchar **parts = g_strsplit (str, ",", -1);
-  guint n = g_strv_length (parts);
-
-  uint8_t (*colors)[4] = g_malloc (n * sizeof (*colors));
-  gsize count = 0;
-
-  for (guint i = 0; i < n; i++) {
-    gchar *s = g_strstrip (parts[i]);
-    if (strlen (s) != 8)
-      continue;
-    guint32 val = (guint32) g_ascii_strtoull (s, NULL, 16);
-    colors[count][0] = (val >> 24) & 0xFF;
-    colors[count][1] = (val >> 16) & 0xFF;
-    colors[count][2] = (val >>  8) & 0xFF;
-    colors[count][3] = (val      ) & 0xFF;
-    count++;
-  }
-
-  g_strfreev (parts);
-  *out_colors = colors;
-  return count;
-}
-
-/* ── GObject lifecycle ───────────────────────────────────────────── */
-
-static void
-edgefirst_overlay_init (EdgefirstOverlay *self)
-{
-  self->in_info_valid = FALSE;
-  self->class_colors = NULL;
-  g_mutex_init (&self->lock);
-  gst_base_transform_set_in_place (GST_BASE_TRANSFORM (self), FALSE);
-}
-
-static void
-edgefirst_overlay_finalize (GObject *object)
-{
-  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (object);
-
-  g_clear_pointer (&self->display_image, hal_tensor_free);
-  g_clear_pointer (&self->processor, hal_image_processor_free);
-  g_clear_pointer (&self->boxes, hal_detect_box_list_free);
-  g_clear_pointer (&self->segmentations, hal_segmentation_list_free);
-  g_free (self->class_colors);
-  g_mutex_clear (&self->lock);
-
-  G_OBJECT_CLASS (parent_class)->finalize (object);
-}
-
-/* ── Properties ──────────────────────────────────────────────────── */
-
-static void
-edgefirst_overlay_set_property (GObject *object, guint prop_id,
-    const GValue *value, GParamSpec *pspec)
-{
-  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (object);
-
-  switch (prop_id) {
-    case PROP_CLASS_COLORS:
-      g_free (self->class_colors);
-      self->class_colors = g_value_dup_string (value);
-      break;
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
-      break;
-  }
-}
-
-static void
-edgefirst_overlay_get_property (GObject *object, guint prop_id,
-    GValue *value, GParamSpec *pspec)
-{
-  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (object);
-
-  switch (prop_id) {
-    case PROP_CLASS_COLORS:
-      g_value_set_string (value, self->class_colors);
-      break;
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
-      break;
-  }
-}
-
-/* ── start / stop ────────────────────────────────────────────────── */
+/* ── Helper: overlay_set_video_caps ──────────────────────────────── */
 
 static gboolean
-edgefirst_overlay_start (GstBaseTransform *trans)
+overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
 {
-  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (trans);
-
-  self->processor = hal_image_processor_new ();
   if (!self->processor) {
-    GST_ELEMENT_ERROR (self, LIBRARY, INIT,
-        ("Failed to create HAL image processor"), (NULL));
+    GST_DEBUG_OBJECT (self,
+        "CAPS before READY_TO_PAUSED — deferring until processor is ready");
     return FALSE;
   }
+
+  GstVideoInfo info;
+  if (!gst_video_info_from_caps (&info, caps)) {
+    GST_ERROR_OBJECT (self, "Failed to parse video caps");
+    return FALSE;
+  }
+
+  self->in_info       = info;
+  self->in_info_valid = TRUE;
+  self->src_pixel_format = gst_format_to_hal (GST_VIDEO_INFO_FORMAT (&info));
+  self->display_w     = (guint) GST_VIDEO_INFO_WIDTH (&info);
+  self->display_h     = (guint) GST_VIDEO_INFO_HEIGHT (&info);
 
   /* Apply class colors if configured */
   if (self->class_colors) {
@@ -361,305 +890,413 @@ edgefirst_overlay_start (GstBaseTransform *trans)
     g_free (colors);
   }
 
-  GST_INFO_OBJECT (self, "HAL image processor created");
-  return TRUE;
-}
-
-static gboolean
-edgefirst_overlay_stop (GstBaseTransform *trans)
-{
-  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (trans);
-
-  g_clear_pointer (&self->display_image, hal_tensor_free);
-  g_clear_pointer (&self->processor, hal_image_processor_free);
-  self->in_info_valid = FALSE;
-
-  g_mutex_lock (&self->lock);
-  g_clear_pointer (&self->boxes, hal_detect_box_list_free);
-  g_clear_pointer (&self->segmentations, hal_segmentation_list_free);
-  g_mutex_unlock (&self->lock);
-
-  return TRUE;
-}
-
-/* ── transform_caps ──────────────────────────────────────────────── */
-
-static GstCaps *
-edgefirst_overlay_transform_caps (GstBaseTransform *trans,
-    GstPadDirection direction, GstCaps *caps, GstCaps *filter)
-{
-  GstCaps *result;
-
-  if (direction == GST_PAD_SINK) {
-    /* Sink → Src: always produce RGBA with matching dimensions/framerate */
-    result = gst_caps_new_empty ();
-
-    for (guint i = 0; i < gst_caps_get_size (caps); i++) {
-      GstStructure *s = gst_caps_get_structure (caps, i);
-      GstStructure *out = gst_structure_new ("video/x-raw",
-          "format", G_TYPE_STRING, "RGBA", NULL);
-
-      /* Copy width, height, framerate if present */
-      const GValue *w = gst_structure_get_value (s, "width");
-      const GValue *h = gst_structure_get_value (s, "height");
-      const GValue *fr = gst_structure_get_value (s, "framerate");
-
-      if (w) gst_structure_set_value (out, "width", w);
-      if (h) gst_structure_set_value (out, "height", h);
-      if (fr) gst_structure_set_value (out, "framerate", fr);
-
-      gst_caps_append_structure (result, out);
-    }
-  } else {
-    /* Src → Sink: accept any of our supported input formats */
-    result = gst_static_pad_template_get_caps (&sink_template);
-  }
-
-  if (filter) {
-    GstCaps *tmp = gst_caps_intersect_full (result, filter,
-        GST_CAPS_INTERSECT_FIRST);
-    gst_caps_unref (result);
-    result = tmp;
-  }
-
-  GST_DEBUG_OBJECT (trans, "transform_caps %s: %" GST_PTR_FORMAT
-      " → %" GST_PTR_FORMAT,
-      direction == GST_PAD_SINK ? "sink→src" : "src→sink", caps, result);
-
-  return result;
-}
-
-/* ── set_caps ────────────────────────────────────────────────────── */
-
-static gboolean
-edgefirst_overlay_set_caps (GstBaseTransform *trans, GstCaps *incaps,
-    GstCaps *outcaps)
-{
-  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (trans);
-
-  if (!gst_video_info_from_caps (&self->in_info, incaps)) {
-    GST_ERROR_OBJECT (self, "failed to parse input caps");
+  hal_tensor_free (self->display_image);
+  self->display_image = hal_image_processor_create_image (self->processor,
+      (size_t) self->display_w, (size_t) self->display_h,
+      HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+  if (!self->display_image) {
+    GST_ERROR_OBJECT (self, "Failed to allocate display image (%ux%u)",
+        self->display_w, self->display_h);
     return FALSE;
   }
-  self->in_info_valid = TRUE;
 
-  GstVideoFormat vfmt = GST_VIDEO_INFO_FORMAT (&self->in_info);
-  self->src_pixel_format = gst_format_to_hal (vfmt);
+  /* Check DMABuf availability */
+  int test_fd = hal_tensor_dmabuf_clone (self->display_image);
+  if (test_fd >= 0) {
+    close (test_fd);
+    self->display_is_dmabuf = TRUE;
+  } else {
+    self->display_is_dmabuf = FALSE;
+  }
 
-  GST_INFO_OBJECT (self, "caps set: %dx%d %s → RGBA",
-      GST_VIDEO_INFO_WIDTH (&self->in_info),
-      GST_VIDEO_INFO_HEIGHT (&self->in_info),
-      gst_video_format_to_string (vfmt));
+  GST_INFO_OBJECT (self, "display image %ux%u RGBA, dmabuf=%s",
+      self->display_w, self->display_h,
+      self->display_is_dmabuf ? "yes" : "no");
 
-  (void) outcaps;
+  /* Forward RGBA caps downstream */
+  GstCaps *out_caps;
+  if (self->display_is_dmabuf) {
+    out_caps = gst_caps_new_simple ("video/x-raw",
+        "format", G_TYPE_STRING, "RGBA",
+        "width",  G_TYPE_INT,    (gint) self->display_w,
+        "height", G_TYPE_INT,    (gint) self->display_h,
+        NULL);
+    gst_caps_set_features (out_caps, 0,
+        gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
+  } else {
+    out_caps = gst_caps_new_simple ("video/x-raw",
+        "format", G_TYPE_STRING, "RGBA",
+        "width",  G_TYPE_INT,    (gint) self->display_w,
+        "height", G_TYPE_INT,    (gint) self->display_h,
+        NULL);
+  }
+
+  GstEvent *caps_event = gst_event_new_caps (out_caps);
+  gst_caps_unref (out_caps);
+  gst_pad_push_event (self->srcpad, caps_event);
   return TRUE;
 }
 
-/* ── transform_size ──────────────────────────────────────────────── */
+/* ── Event handlers ──────────────────────────────────────────────── */
 
 static gboolean
-edgefirst_overlay_transform_size (GstBaseTransform *trans,
-    GstPadDirection direction, GstCaps *caps, gsize size,
-    GstCaps *othercaps, gsize *othersize)
+edgefirst_overlay_video_event (GstPad *pad, GstObject *parent, GstEvent *event)
 {
-  if (direction == GST_PAD_SINK) {
-    /* Output is RGBA: width * height * 4 */
-    GstStructure *s = gst_caps_get_structure (othercaps, 0);
-    gint w = 0, h = 0;
-    gst_structure_get_int (s, "width", &w);
-    gst_structure_get_int (s, "height", &h);
-    if (w > 0 && h > 0) {
-      *othersize = (gsize) w * h * 4;
+  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (parent);
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_CAPS: {
+      GstCaps *caps;
+      gst_event_parse_caps (event, &caps);
+      gboolean ok = overlay_set_video_caps (self, caps);
+      gst_event_unref (event);
+      return ok;
+    }
+    case GST_EVENT_SEGMENT:
+      return gst_pad_push_event (self->srcpad, event);
+    case GST_EVENT_EOS:
+    case GST_EVENT_FLUSH_START:
+      g_mutex_lock (&self->lock);
+      self->flushing = TRUE;
+      g_cond_broadcast (&self->decode_cond);
+      g_mutex_unlock (&self->lock);
+      return gst_pad_push_event (self->srcpad, event);
+    case GST_EVENT_FLUSH_STOP:
+      g_mutex_lock (&self->lock);
+      self->flushing = FALSE;
+      g_mutex_unlock (&self->lock);
+      return gst_pad_push_event (self->srcpad, event);
+    default:
+      return gst_pad_event_default (pad, parent, event);
+  }
+}
+
+static gboolean
+edgefirst_overlay_tensors_event (GstPad *pad G_GNUC_UNUSED,
+    GstObject *parent, GstEvent *event)
+{
+  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (parent);
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_CAPS: {
+      GstCaps *caps;
+      gst_event_parse_caps (event, &caps);
+      /* Auto-configure decoder from caps if no model-config was set */
+      if (!self->decoder)
+        overlay_auto_config_decoder (self, caps);
+      gst_event_unref (event);
       return TRUE;
     }
+    case GST_EVENT_EOS:
+    case GST_EVENT_FLUSH_START:
+      g_mutex_lock (&self->lock);
+      self->flushing = TRUE;
+      g_cond_broadcast (&self->decode_cond);
+      g_mutex_unlock (&self->lock);
+      gst_event_unref (event);
+      return TRUE;
+    case GST_EVENT_FLUSH_STOP:
+      g_mutex_lock (&self->lock);
+      self->flushing = FALSE;
+      g_mutex_unlock (&self->lock);
+      gst_event_unref (event);
+      return TRUE;
+    default:
+      gst_event_unref (event);
+      return TRUE;
   }
-
-  (void) trans;
-  (void) caps;
-  (void) size;
-  return FALSE;
 }
-
-/* ── decide_allocation ───────────────────────────────────────────── */
 
 static gboolean
-edgefirst_overlay_decide_allocation (GstBaseTransform *trans, GstQuery *query)
+edgefirst_overlay_src_query (GstPad *pad, GstObject *parent, GstQuery *query)
 {
-  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (trans);
-
-  if (!self->in_info_valid) {
-    GST_ERROR_OBJECT (self, "input caps not set before decide_allocation");
-    return FALSE;
-  }
-
-  guint w = GST_VIDEO_INFO_WIDTH (&self->in_info);
-  guint h = GST_VIDEO_INFO_HEIGHT (&self->in_info);
-
-  /* Allocate persistent RGBA display image via processor */
-  g_clear_pointer (&self->display_image, hal_tensor_free);
-  self->display_image = hal_image_processor_create_image (self->processor,
-      w, h, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
-  if (!self->display_image) {
-    GST_ERROR_OBJECT (self, "failed to create RGBA display image (%ux%u)",
-        w, h);
-    return FALSE;
-  }
-
-  GST_INFO_OBJECT (self, "RGBA display image allocated (%ux%u, "
-      "processor-selected backend)", w, h);
-
-  /* Don't chain to parent — we handle output allocation in
-   * prepare_output_buffer. */
-  (void) query;
-  return TRUE;
+  return gst_pad_query_default (pad, parent, query);
 }
 
-/* ── prepare_output_buffer ───────────────────────────────────────── */
+/* ── Video chain ─────────────────────────────────────────────────── */
 
 static GstFlowReturn
-edgefirst_overlay_prepare_output_buffer (GstBaseTransform *trans,
-    GstBuffer *inbuf G_GNUC_UNUSED, GstBuffer **outbuf)
+edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
+    GstObject *parent, GstBuffer *buf)
 {
-  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (trans);
-  guint w = GST_VIDEO_INFO_WIDTH (&self->in_info);
-  guint h = GST_VIDEO_INFO_HEIGHT (&self->in_info);
-  gsize size = (gsize) w * h * 4;
+  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (parent);
 
-  *outbuf = gst_buffer_new_allocate (NULL, size, NULL);
-  if (!*outbuf) {
-    GST_ERROR_OBJECT (self, "failed to allocate output buffer (%zu bytes)",
-        size);
-    return GST_FLOW_ERROR;
+  if (!self->in_info_valid)
+    return GST_FLOW_NOT_NEGOTIATED;
+
+  /* ── model-sync wait ─────────────────────────────────────────── */
+  if (self->model_sync) {
+    GstClockTime pts = GST_BUFFER_PTS (buf);
+    g_mutex_lock (&self->lock);
+    if (pts != GST_CLOCK_TIME_NONE && self->decode_ts != GST_CLOCK_TIME_NONE) {
+      if (self->model_sync_timeout_ms > 0) {
+        gint64 deadline = g_get_monotonic_time () +
+            (gint64) self->model_sync_timeout_ms * G_TIME_SPAN_MILLISECOND;
+        while (self->decode_ts < pts && !self->flushing)
+          if (!g_cond_wait_until (&self->decode_cond, &self->lock, deadline))
+            break;
+      } else {
+        while (self->decode_ts < pts && !self->flushing)
+          g_cond_wait (&self->decode_cond, &self->lock);
+      }
+    }
+    if (self->flushing) {
+      g_mutex_unlock (&self->lock);
+      gst_buffer_unref (buf);
+      return GST_FLOW_FLUSHING;
+    }
   }
 
-  return GST_FLOW_OK;
-}
+  /* Snapshot decoded results under lock.
+   * When model_sync=TRUE the mutex is still held from the wait loop above;
+   * when model_sync=FALSE we acquire it here. Either way we release it below. */
+  EdgeFirstDetectBoxList    *boxes_snap = NULL;
+  EdgeFirstSegmentationList *segs_snap  = NULL;
+  {
+    if (!self->model_sync) g_mutex_lock (&self->lock);
+    boxes_snap = self->boxes_obj ? g_object_ref (self->boxes_obj) : NULL;
+    segs_snap  = self->segs_obj  ? g_object_ref (self->segs_obj)  : NULL;
+    g_mutex_unlock (&self->lock);
+  }
 
-/* ── transform ───────────────────────────────────────────────────── */
-
-static GstFlowReturn
-edgefirst_overlay_transform (GstBaseTransform *trans,
-    GstBuffer *inbuf, GstBuffer *outbuf)
-{
-  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (trans);
-
-  /* 1. Wrap input buffer as HAL tensor */
-  hal_tensor *src_img = create_input_image (self, inbuf);
+  /* ── Convert input to RGBA display_image ─────────────────────── */
+  hal_tensor *src_img = create_input_image (self, buf);
   if (!src_img) {
-    GST_ERROR_OBJECT (self, "failed to create input image");
+    g_clear_object (&boxes_snap);
+    g_clear_object (&segs_snap);
+    gst_buffer_unref (buf);
     return GST_FLOW_ERROR;
   }
 
-  /* 2. GPU convert to RGBA at display resolution */
-  int ret = hal_image_processor_convert (self->processor, src_img,
+  int convert_ret = hal_image_processor_convert (self->processor, src_img,
       self->display_image, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
-
   hal_tensor_free (src_img);
 
-  if (ret != 0) {
-    GST_ERROR_OBJECT (self, "HAL convert failed (%d)", ret);
+  if (convert_ret != 0) {
+    GST_ERROR_OBJECT (self, "HAL convert failed (%d)", convert_ret);
+    g_clear_object (&boxes_snap);
+    g_clear_object (&segs_snap);
+    gst_buffer_unref (buf);
     return GST_FLOW_ERROR;
   }
 
-  /* 3. Draw overlays if results available */
-  g_mutex_lock (&self->lock);
-  hal_detect_box_list *boxes = self->boxes;
-  hal_segmentation_list *segs = self->segmentations;
+  /* ── Draw decoded masks ───────────────────────────────────────── */
+  hal_detect_box_list    *boxes_hal = edgefirst_detect_box_list_get_hal (boxes_snap);
+  hal_segmentation_list  *segs_hal  = edgefirst_segmentation_list_get_hal (segs_snap);
 
-  if (boxes || segs) {
-    ret = hal_image_processor_draw_masks (self->processor,
-        self->display_image, boxes, segs);
-    if (ret != 0) {
-      GST_WARNING_OBJECT (self, "draw_masks failed (%d)", ret);
+  if ((boxes_hal || segs_hal) && hal_image_processor_draw_decoded_masks != NULL) {
+    hal_image_processor_draw_decoded_masks (self->processor, self->display_image,
+        boxes_hal, segs_hal, NULL, self->opacity,
+        self->has_letterbox ? self->letterbox : NULL,
+        (enum hal_color_mode) self->color_mode);
+  } else if (boxes_hal || segs_hal) {
+    static gboolean warned_no_draw = FALSE;
+    if (G_UNLIKELY (!warned_no_draw)) {
+      warned_no_draw = TRUE;
+      GST_WARNING_OBJECT (self,
+          "hal_image_processor_draw_decoded_masks not available in this HAL version; "
+          "overlay drawing disabled (upgrade to HAL >= 0.15.0)");
     }
+  }
+
+  g_clear_object (&boxes_snap);
+  g_clear_object (&segs_snap);
+
+  /* ── Wrap display_image as output GstBuffer ───────────────────── */
+  GstBuffer *outbuf = NULL;
+  guint w = self->display_w, h = self->display_h;
+  gboolean dmabuf_ok = FALSE;
+
+  if (self->display_is_dmabuf) {
+    int fd = hal_tensor_dmabuf_clone (self->display_image);
+    if (fd >= 0) {
+      outbuf = gst_buffer_new ();
+      gst_buffer_append_memory (outbuf,
+          gst_dmabuf_allocator_alloc (self->dmabuf_allocator, fd, (gsize) w * h * 4));
+      dmabuf_ok = TRUE;
+    }
+  }
+
+  if (!dmabuf_ok) {
+    outbuf = gst_buffer_new_allocate (NULL, (gsize) w * h * 4, NULL);
+    struct hal_tensor_map *tmap = hal_tensor_map_create (self->display_image);
+    if (tmap) {
+      GstMapInfo map;
+      if (gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
+        memcpy (map.data, hal_tensor_map_data_const (tmap), (gsize) w * h * 4);
+        gst_buffer_unmap (outbuf, &map);
+      }
+      hal_tensor_map_unmap (tmap);
+    }
+  }
+
+  GST_BUFFER_PTS (outbuf)      = GST_BUFFER_PTS (buf);
+  GST_BUFFER_DURATION (outbuf) = GST_BUFFER_DURATION (buf);
+
+  gst_buffer_unref (buf);
+  return gst_pad_push (self->srcpad, outbuf);
+}
+
+/* ── Helper: gst_memory_to_hal_tensor ────────────────────────────── */
+
+/* Create a HAL tensor wrapping a GstMemory block.
+ * Tries DMABuf zero-copy first; falls back to hal_tensor_new + memcpy.
+ * shape/ndim are used for the memcpy fallback; for DMABuf, the fd carries
+ * the data. */
+static hal_tensor *
+gst_memory_to_hal_tensor (GstMemory *mem,
+    enum hal_dtype dtype, const size_t *shape, size_t ndim)
+{
+  hal_tensor *t = NULL;
+
+  if (gst_is_dmabuf_memory (mem)) {
+    int fd = gst_dmabuf_memory_get_fd (mem);
+    t = hal_tensor_from_fd (dtype, fd, shape, ndim, NULL);
+  }
+
+  if (!t) {
+    t = hal_tensor_new (dtype, shape, ndim, HAL_TENSOR_MEMORY_MEM, NULL);
+    if (!t) return NULL;
+
+    struct hal_tensor_map *tmap = hal_tensor_map_create (t);
+    if (!tmap) { hal_tensor_free (t); return NULL; }
+
+    GstMapInfo map;
+    gst_memory_map (mem, &map, GST_MAP_READ);
+    memcpy (hal_tensor_map_data (tmap), map.data, map.size);
+    gst_memory_unmap (mem, &map);
+    hal_tensor_map_unmap (tmap);
+  }
+
+  return t;
+}
+
+/* ── Tensors chain ────────────────────────────────────────────────── */
+
+static GstFlowReturn
+edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
+    GstObject *parent, GstBuffer *buf)
+{
+  EdgefirstOverlay *self = EDGEFIRST_OVERLAY (parent);
+
+  if (!self->decoder) {
+    gst_buffer_unref (buf);
+    return GST_FLOW_OK;   /* pass-through: no decoder configured */
+  }
+
+  g_mutex_lock (&self->lock);
+  if (self->flushing) {
+    g_mutex_unlock (&self->lock);
+    gst_buffer_unref (buf);
+    return GST_FLOW_FLUSHING;
   }
   g_mutex_unlock (&self->lock);
 
-  /* 4. Copy RGBA display image data into output GstBuffer */
-  hal_tensor_map *tmap = hal_tensor_map_create (self->display_image);
-  if (!tmap) {
-    GST_ERROR_OBJECT (self, "failed to map display image");
+  /* ── Wrap GstBuffer memories as HAL tensors ─────────────────────── */
+  guint n_mem = gst_buffer_n_memory (buf);
+  hal_tensor **outputs = g_new0 (hal_tensor *, n_mem);
+  gboolean ok = TRUE;
+
+  for (guint i = 0; i < n_mem; i++) {
+    GstMemory *mem = gst_buffer_peek_memory (buf, i);
+
+    /* Use cached shape from CAPS event if available; otherwise use flat 1D shape */
+    size_t  ndim;
+    size_t  shape[8];
+    enum hal_dtype dtype = HAL_DTYPE_F32;
+
+    if (i < (guint) self->tensor_count && self->tensor_ndims[i] > 0) {
+      ndim  = self->tensor_ndims[i];
+      dtype = self->tensor_dtypes[i];
+      for (size_t j = 0; j < ndim; j++)
+        shape[j] = self->tensor_shapes[i][j];
+    } else {
+      size_t byte_size = gst_memory_get_sizes (mem, NULL, NULL);
+      shape[0] = byte_size;
+      ndim = 1;
+    }
+
+    outputs[i] = gst_memory_to_hal_tensor (mem, dtype, shape, ndim);
+    if (!outputs[i]) {
+      GST_WARNING_OBJECT (self, "Failed to wrap tensor %u as HAL tensor", i);
+      ok = FALSE;
+      break;
+    }
+  }
+
+  if (!ok) {
+    for (guint i = 0; i < n_mem; i++) hal_tensor_free (outputs[i]);
+    g_free (outputs);
+    gst_buffer_unref (buf);
     return GST_FLOW_ERROR;
   }
 
-  const uint8_t *rgba_data = hal_tensor_map_data_const (tmap);
-  gsize rgba_size = (gsize) GST_VIDEO_INFO_WIDTH (&self->in_info) *
-      GST_VIDEO_INFO_HEIGHT (&self->in_info) * 4;
+  /* ── Decode ─────────────────────────────────────────────────────── */
+  hal_detect_box_list *new_boxes = NULL;
+  struct hal_proto_data *proto   = NULL;
 
-  GstMapInfo omap;
-  if (!gst_buffer_map (outbuf, &omap, GST_MAP_WRITE)) {
-    hal_tensor_map_unmap (tmap);
-    GST_ERROR_OBJECT (self, "failed to map output buffer");
-    return GST_FLOW_ERROR;
+  if (hal_decoder_decode_proto != NULL) {
+    /* HAL 0.15.0+: decode + proto in one call (supports segmentation masks) */
+    proto = hal_decoder_decode_proto (self->decoder,
+        (const struct hal_tensor *const *) outputs, n_mem, &new_boxes);
+  } else {
+    /* HAL < 0.15.0: decode without proto (detection only, no segmentation masks) */
+    hal_decoder_decode (self->decoder,
+        (const struct hal_tensor *const *) outputs, n_mem, &new_boxes, NULL);
   }
 
-  memcpy (omap.data, rgba_data, rgba_size);
-  gst_buffer_unmap (outbuf, &omap);
-  hal_tensor_map_unmap (tmap);
+  for (guint i = 0; i < n_mem; i++) hal_tensor_free (outputs[i]);
+  g_free (outputs);
 
+  if (!new_boxes) {
+    if (proto && hal_proto_data_free != NULL) hal_proto_data_free (proto);
+    gst_buffer_unref (buf);
+    if (errno != 0) {
+      GST_WARNING_OBJECT (self, "hal decoder failed: %s", strerror (errno));
+      return GST_FLOW_ERROR;
+    }
+    return GST_FLOW_OK;   /* zero detections this frame */
+  }
+
+  /* ── Materialize masks ───────────────────────────────────────────── */
+  hal_segmentation_list *new_segs = NULL;
+  if (proto) {
+    if (hal_image_processor_materialize_masks != NULL) {
+      new_segs = hal_image_processor_materialize_masks (self->processor,
+          new_boxes, proto, self->has_letterbox ? self->letterbox : NULL);
+    } else {
+      GST_WARNING_OBJECT (self,
+          "hal_image_processor_materialize_masks not available in this HAL version; "
+          "segmentation masks will not be produced");
+    }
+    if (hal_proto_data_free != NULL) hal_proto_data_free (proto);
+  }
+
+  /* ── Wrap in GObjects ────────────────────────────────────────────── */
+  guint mw = self->model_width  > 0 ? self->model_width  : 0;
+  guint mh = self->model_height > 0 ? self->model_height : 0;
+  EdgeFirstDetectBoxList    *boxes_obj = edgefirst_detect_box_list_new_normalized (
+      new_boxes, self->normalized, mw, mh);
+  EdgeFirstSegmentationList *segs_obj  = new_segs
+      ? edgefirst_segmentation_list_new (new_segs) : NULL;
+
+  /* ── Update stored state under lock ─────────────────────────────── */
+  g_mutex_lock (&self->lock);
+  g_clear_object (&self->boxes_obj);
+  g_clear_object (&self->segs_obj);
+  self->boxes_obj = g_object_ref (boxes_obj);
+  self->segs_obj  = segs_obj ? g_object_ref (segs_obj) : NULL;
+  if (GST_BUFFER_PTS (buf) != GST_CLOCK_TIME_NONE)
+    self->decode_ts = GST_BUFFER_PTS (buf);
+  g_cond_signal (&self->decode_cond);
+  g_mutex_unlock (&self->lock);
+
+  /* ── Emit signal ─────────────────────────────────────────────────── */
+  g_signal_emit (self, signals[SIGNAL_NEW_DETECTION], 0, boxes_obj, segs_obj);
+
+  g_object_unref (boxes_obj);
+  g_clear_object (&segs_obj);
+
+  gst_buffer_unref (buf);
   return GST_FLOW_OK;
-}
-
-/* ── Public API: set_results ─────────────────────────────────────── */
-
-void
-edgefirst_overlay_set_results (EdgefirstOverlay *overlay,
-    hal_detect_box_list *boxes, hal_segmentation_list *segmentations)
-{
-  g_return_if_fail (EDGEFIRST_IS_OVERLAY (overlay));
-
-  g_mutex_lock (&overlay->lock);
-
-  g_clear_pointer (&overlay->boxes, hal_detect_box_list_free);
-  g_clear_pointer (&overlay->segmentations, hal_segmentation_list_free);
-  overlay->boxes = boxes;
-  overlay->segmentations = segmentations;
-
-  g_mutex_unlock (&overlay->lock);
-}
-
-/* ── class_init ──────────────────────────────────────────────────── */
-
-static void
-edgefirst_overlay_class_init (EdgefirstOverlayClass *klass)
-{
-  GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
-  GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
-  GstBaseTransformClass *trans_class = GST_BASE_TRANSFORM_CLASS (klass);
-
-  gobject_class->set_property = edgefirst_overlay_set_property;
-  gobject_class->get_property = edgefirst_overlay_get_property;
-  gobject_class->finalize = edgefirst_overlay_finalize;
-
-  /* Properties */
-  g_object_class_install_property (gobject_class, PROP_CLASS_COLORS,
-      g_param_spec_string ("class-colors", "Class Colors",
-          "Comma-separated RGBA hex values for mask colors "
-          "(e.g. \"FF0000FF,00FF00FF,0000FFFF\")",
-          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-  /* Element metadata */
-  gst_element_class_set_static_metadata (element_class,
-      "EdgeFirst Overlay",
-      "Filter/Effect/Video",
-      "GPU-accelerated segmentation mask and bounding box overlay renderer",
-      "Au-Zone Technologies <support@au-zone.com>");
-
-  gst_element_class_add_static_pad_template (element_class, &sink_template);
-  gst_element_class_add_static_pad_template (element_class, &src_template);
-
-  /* Virtual methods */
-  trans_class->start = edgefirst_overlay_start;
-  trans_class->stop = edgefirst_overlay_stop;
-  trans_class->transform_caps = edgefirst_overlay_transform_caps;
-  trans_class->set_caps = edgefirst_overlay_set_caps;
-  trans_class->transform_size = edgefirst_overlay_transform_size;
-  trans_class->decide_allocation = edgefirst_overlay_decide_allocation;
-  trans_class->prepare_output_buffer = edgefirst_overlay_prepare_output_buffer;
-  trans_class->transform = edgefirst_overlay_transform;
-
-  trans_class->passthrough_on_same_caps = FALSE;
-
-  GST_DEBUG_CATEGORY_INIT (edgefirst_overlay_debug,
-      "edgefirstoverlay", 0, "EdgeFirst Overlay");
 }

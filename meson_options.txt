@@ -12,3 +12,6 @@ option('tests', type : 'feature', value : 'auto',
 
 option('docs', type : 'feature', value : 'auto',
        description : 'Build documentation')
+
+option('introspection', type : 'feature', value : 'disabled',
+       description : 'Generate GObject introspection data')
