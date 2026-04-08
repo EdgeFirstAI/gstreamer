@@ -78,6 +78,7 @@ edgefirst_camera_adaptor_colorspace_get_type (void)
       { EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_RGB, "RGB", "rgb" },
       { EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_BGR, "BGR", "bgr" },
       { EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY, "Grayscale", "gray" },
+      { EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_RGBA, "RGBA", "rgba" },
       { 0, NULL, NULL },
     };
     GType t = g_enum_register_static ("EdgefirstCameraAdaptorColorspace",
@@ -111,6 +112,15 @@ edgefirst_camera_adaptor_dtype_get_type (void)
     static const GEnumValue values[] = {
       { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT8, "Unsigned 8-bit", "uint8" },
       { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT8, "Signed 8-bit", "int8" },
+      { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT16, "Unsigned 16-bit", "uint16" },
+      { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT16, "Signed 16-bit", "int16" },
+      { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT32, "Unsigned 32-bit", "uint32" },
+      { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT32, "Signed 32-bit", "int32" },
+      { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT64, "Unsigned 64-bit", "uint64" },
+      { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT64, "Signed 64-bit", "int64" },
+      { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT16, "16-bit float", "float16" },
+      { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT32, "32-bit float", "float32" },
+      { EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT64, "64-bit float", "float64" },
       { 0, NULL, NULL },
     };
     GType t = g_enum_register_static ("EdgefirstCameraAdaptorDtype", values);
@@ -154,6 +164,8 @@ enum {
   PROP_LETTERBOX_BOTTOM,
   PROP_LETTERBOX_LEFT,
   PROP_LETTERBOX_RIGHT,
+  PROP_MODEL_MEAN,
+  PROP_MODEL_STD,
 };
 
 /* ── Instance struct ─────────────────────────────────────────────── */
@@ -174,6 +186,8 @@ struct _EdgefirstCameraAdaptor {
   gint lb_top, lb_bottom, lb_left, lb_right;
   gboolean lb_top_override, lb_bottom_override;
   gboolean lb_left_override, lb_right_override;
+  gchar *model_mean;
+  gchar *model_std;
 
   /* Runtime state */
   hal_image_processor *processor;
@@ -281,16 +295,63 @@ static const char *
 dtype_to_nnstreamer_string (EdgefirstCameraAdaptorDtype dtype)
 {
   switch (dtype) {
-    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT8: return "int8";
-    default:                                   return "uint8";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT8:   return "uint8";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT8:    return "int8";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT16:  return "uint16";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT16:   return "int16";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT32:  return "uint32";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT32:   return "int32";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT64:  return "uint64";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT64:   return "int64";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT16: return "float16";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT32: return "float32";
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT64: return "float64";
+    default:                                      return "uint8";
+  }
+}
+
+static guint
+dtype_byte_size (EdgefirstCameraAdaptorDtype dtype)
+{
+  switch (dtype) {
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT8:
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT8:
+      return 1;
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT16:
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT16:
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT16:
+      return 2;
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT32:
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT32:
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT32:
+      return 4;
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT64:
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT64:
+    case EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT64:
+      return 8;
+    default:
+      return 1;
   }
 }
 
 static void
 resolve_target_format (EdgefirstCameraAdaptor *self)
 {
-  self->target_dtype = (self->dtype == EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT8)
-      ? HAL_DTYPE_I8 : HAL_DTYPE_U8;
+  /* GObject enum values match hal_dtype values 1:1 */
+  static const enum hal_dtype dtype_map[] = {
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT8]   = HAL_DTYPE_U8,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT8]    = HAL_DTYPE_I8,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT16]  = HAL_DTYPE_U16,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT16]   = HAL_DTYPE_I16,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT32]  = HAL_DTYPE_U32,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT32]   = HAL_DTYPE_I32,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT64]  = HAL_DTYPE_U64,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT64]   = HAL_DTYPE_I64,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT16] = HAL_DTYPE_F16,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT32] = HAL_DTYPE_F32,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT64] = HAL_DTYPE_F64,
+  };
+  self->target_dtype = dtype_map[self->dtype];
   switch (self->colorspace) {
     case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY:
       self->target_format = HAL_PIXEL_FORMAT_GREY;
@@ -298,6 +359,10 @@ resolve_target_format (EdgefirstCameraAdaptor *self)
     case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_BGR:
       self->target_format = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW)
           ? HAL_PIXEL_FORMAT_PLANAR_RGB : HAL_PIXEL_FORMAT_BGRA;
+      break;
+    case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_RGBA:
+      self->target_format = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW)
+          ? HAL_PIXEL_FORMAT_PLANAR_RGBA : HAL_PIXEL_FORMAT_RGBA;
       break;
     default:
       self->target_format = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW)
@@ -445,6 +510,11 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
   GstVideoFormat vfmt = GST_VIDEO_INFO_FORMAT (info);
   enum hal_pixel_format pixel_fmt = gst_format_to_hal_pixel (vfmt);
 
+  /* Note: for NV12 from v4l2h264dec, each DMA-BUF fd covers only its own
+   * plane. The Y fd buffer size includes the aligned height (e.g. 1088 rows).
+   * We pass the nominal height here; the HAL derives the actual allocation
+   * size from fstat on the fd. */
+
   if ((int) pixel_fmt == -1) {
     GST_ERROR_OBJECT (self, "unsupported input format %s",
         gst_video_format_to_string (vfmt));
@@ -458,10 +528,8 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
   }
 
   GstMemory *mem0 = gst_buffer_peek_memory (inbuf, 0);
-  if (!gst_is_dmabuf_memory (mem0)) {
-    GST_ERROR_OBJECT (self, "input buffer is not DMA-BUF");
-    return NULL;
-  }
+  if (!gst_is_dmabuf_memory (mem0))
+    return NULL;  /* not DMA-BUF — caller falls back to memcpy path */
 
   int fd = gst_dmabuf_memory_get_fd (mem0);
   gsize offset = 0;
@@ -508,21 +576,89 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
   hal_plane_descriptor_set_stride (pd, (size_t) stride);
 
   struct hal_plane_descriptor *chroma = NULL;
-  if (n_mem >= 2 && pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
-    GstMemory *mem1 = gst_buffer_peek_memory (inbuf, 1);
-    if (gst_is_dmabuf_memory (mem1)) {
-      int uv_fd = gst_dmabuf_memory_get_fd (mem1);
+  if (pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
+    /* Diagnostic: dump all available NV12 plane info */
+    GST_INFO_OBJECT (self, "NV12 import: n_mem=%u vmeta=%p", n_mem, (void *) vmeta);
+    if (vmeta) {
+      GST_INFO_OBJECT (self, "  vmeta: n_planes=%u, offset[0]=%" G_GSIZE_FORMAT
+          " offset[1]=%" G_GSIZE_FORMAT " stride[0]=%d stride[1]=%d",
+          vmeta->n_planes,
+          vmeta->n_planes > 0 ? vmeta->offset[0] : 0,
+          vmeta->n_planes > 1 ? vmeta->offset[1] : 0,
+          vmeta->n_planes > 0 ? (int) vmeta->stride[0] : 0,
+          vmeta->n_planes > 1 ? (int) vmeta->stride[1] : 0);
+    }
+    GST_INFO_OBJECT (self, "  GstVideoInfo: offset[0]=%" G_GSIZE_FORMAT
+        " offset[1]=%" G_GSIZE_FORMAT " stride[0]=%d stride[1]=%d",
+        GST_VIDEO_INFO_PLANE_OFFSET (info, 0),
+        GST_VIDEO_INFO_PLANE_OFFSET (info, 1),
+        GST_VIDEO_INFO_PLANE_STRIDE (info, 0),
+        GST_VIDEO_INFO_PLANE_STRIDE (info, 1));
+
+    if (n_mem >= 2) {
+      /* Two DMA-BUF memory blocks → always use each fd for its own plane.
+       * vmeta->offset[1] is the logical frame offset (Y_stride × Y_height),
+       * NOT an offset within the UV fd's buffer.  Each GstMemory's dma_buf
+       * covers only its own plane's data.  This handles both libcamerasrc
+       * (separate allocations) and v4l2h264dec (separate dma_bufs for same
+       * physical memory) correctly. */
+      GstMemory *mem1 = gst_buffer_peek_memory (inbuf, 1);
+      if (gst_is_dmabuf_memory (mem1)) {
+        int uv_fd = gst_dmabuf_memory_get_fd (mem1);
+        gsize mem1_offset = 0;
+        gst_memory_get_sizes (mem1, &mem1_offset, NULL);
+        gint uv_stride = vmeta && vmeta->n_planes >= 2
+            ? (gint) vmeta->stride[1]
+            : GST_VIDEO_INFO_PLANE_STRIDE (info, 1);
+
+        chroma = hal_plane_descriptor_new (uv_fd);
+        if (chroma) {
+          if (mem1_offset > 0)
+            hal_plane_descriptor_set_offset (chroma, mem1_offset);
+          if (uv_stride > 0)
+            hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
+        }
+        GST_INFO_OBJECT (self, "  NV12 two-fd planes: y_fd=%d uv_fd=%d "
+            "mem1_offset=%" G_GSIZE_FORMAT " uv_stride=%d",
+            fd, uv_fd, mem1_offset, uv_stride);
+      }
+    } else {
+      /* Single-memory NV12: Y and UV in one contiguous DMA-BUF
+       * (e.g. v4l2h264dec). UV plane starts at offset from GstVideoMeta
+       * or GstVideoInfo. */
       gsize uv_offset = 0;
-      gst_memory_get_sizes (mem1, &uv_offset, NULL);
-      chroma = hal_plane_descriptor_new (uv_fd);
-      if (chroma) {
-        if (uv_offset > 0)
+      gint uv_stride = 0;
+      if (vmeta && vmeta->n_planes >= 2 && vmeta->offset[1] > 0) {
+        uv_offset = vmeta->offset[1];
+        uv_stride = (gint) vmeta->stride[1];
+      } else if (GST_VIDEO_INFO_PLANE_OFFSET (info, 1) > 0) {
+        uv_offset = (gsize) GST_VIDEO_INFO_PLANE_OFFSET (info, 1);
+        uv_stride = GST_VIDEO_INFO_PLANE_STRIDE (info, 1);
+      } else {
+        /* Last resort: compute from stride * height */
+        uv_offset = (gsize) stride * height;
+        uv_stride = stride;
+        GST_WARNING_OBJECT (self, "  NV12 single-mem: no offset metadata, "
+            "computing uv_offset=%zu from stride(%d)*height(%u)",
+            (size_t) uv_offset, stride, height);
+      }
+
+      if (uv_offset > 0) {
+        chroma = hal_plane_descriptor_new (fd);
+        if (chroma) {
           hal_plane_descriptor_set_offset (chroma, uv_offset);
-        gint uv_stride = vmeta ? (gint) vmeta->stride[1]
-                               : GST_VIDEO_INFO_PLANE_STRIDE (info, 1);
-        hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
+          if (uv_stride > 0)
+            hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
+          GST_INFO_OBJECT (self, "  NV12 single-mem: uv_offset=%" G_GSIZE_FORMAT
+              " uv_stride=%d", uv_offset, uv_stride);
+        }
+      } else {
+        GST_ERROR_OBJECT (self, "  NV12 single-mem: cannot determine UV offset!");
       }
     }
+
+    if (!chroma)
+      GST_WARNING_OBJECT (self, "  NV12 import WITHOUT chroma plane — will produce bad output");
   }
 
   /* hal_import_image CONSUMES pd and chroma */
@@ -536,6 +672,90 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
   InputCacheKey *heap_key = g_new (InputCacheKey, 1);
   *heap_key = lookup_key;
   g_hash_table_insert (self->input_cache, heap_key, tensor);
+  return tensor;
+}
+
+/**
+ * System-memory fallback: allocate a HAL tensor and memcpy the frame data.
+ * Returns a new tensor the caller MUST free with hal_tensor_free().
+ */
+static hal_tensor *
+create_input_from_sysmem (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
+{
+  GstVideoInfo *info = &self->in_info;
+  guint width = GST_VIDEO_INFO_WIDTH (info);
+  guint height = GST_VIDEO_INFO_HEIGHT (info);
+  GstVideoFormat vfmt = GST_VIDEO_INFO_FORMAT (info);
+  enum hal_pixel_format pixel_fmt = gst_format_to_hal_pixel (vfmt);
+
+  static gboolean warned = FALSE;
+  if (G_UNLIKELY (!warned)) {
+    warned = TRUE;
+    GST_WARNING_OBJECT (self, "input is not DMA-BUF; using memcpy fallback "
+        "(zero-copy disabled)");
+  }
+
+  hal_tensor *tensor = hal_image_processor_create_image (self->processor,
+      (size_t) width, (size_t) height, pixel_fmt, HAL_DTYPE_U8);
+  if (!tensor) {
+    GST_ERROR_OBJECT (self, "hal_image_processor_create_image failed");
+    return NULL;
+  }
+
+  struct hal_tensor_map *tmap = hal_tensor_map_create (tensor);
+  if (!tmap) {
+    hal_tensor_free (tensor);
+    return NULL;
+  }
+  uint8_t *dst = (uint8_t *) hal_tensor_map_data (tmap);
+
+  GstVideoFrame frame;
+  if (!gst_video_frame_map (&frame, info, inbuf, GST_MAP_READ)) {
+    hal_tensor_map_unmap (tmap);
+    hal_tensor_free (tensor);
+    return NULL;
+  }
+
+  /* Row-by-row copy handles stride padding from VPU/ISP buffers */
+  size_t row_bytes;
+  switch (pixel_fmt) {
+    case HAL_PIXEL_FORMAT_RGBA:
+    case HAL_PIXEL_FORMAT_BGRA:         row_bytes = width * 4; break;
+    case HAL_PIXEL_FORMAT_RGB:
+    case HAL_PIXEL_FORMAT_PLANAR_RGB:   row_bytes = width * 3; break;
+    case HAL_PIXEL_FORMAT_YUYV:
+    case HAL_PIXEL_FORMAT_VYUY:
+    case HAL_PIXEL_FORMAT_NV16:         row_bytes = width * 2; break;
+    case HAL_PIXEL_FORMAT_NV12:
+    case HAL_PIXEL_FORMAT_GREY:         row_bytes = width;     break;
+    default:                            row_bytes = width * 3; break;
+  }
+
+  if (pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
+    /* Y plane */
+    const guint8 *y_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+    for (guint y = 0; y < height; y++)
+      memcpy (dst + y * width, y_data + y * y_stride, width);
+    /* UV plane */
+    const guint8 *uv_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 1);
+    gint uv_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 1);
+    uint8_t *uv_dst = dst + height * width;
+    for (guint y = 0; y < height / 2; y++)
+      memcpy (uv_dst + y * width, uv_data + y * uv_stride, width);
+  } else {
+    const guint8 *src_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
+    gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+    if ((gsize) stride == row_bytes) {
+      memcpy (dst, src_data, row_bytes * height);
+    } else {
+      for (guint y = 0; y < height; y++)
+        memcpy (dst + y * row_bytes, src_data + y * stride, row_bytes);
+    }
+  }
+
+  gst_video_frame_unmap (&frame);
+  hal_tensor_map_unmap (tmap);
   return tensor;
 }
 
@@ -574,6 +794,8 @@ edgefirst_camera_adaptor_finalize (GObject *object)
     gst_clear_object (&self->downstream_pool);
   }
   g_clear_pointer (&self->processor, hal_image_processor_free);
+  g_free (self->model_mean);
+  g_free (self->model_std);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -627,6 +849,20 @@ edgefirst_camera_adaptor_set_property (GObject *object, guint prop_id,
       self->lb_right = g_value_get_int (value);
       self->lb_right_override = TRUE;
       break;
+    case PROP_MODEL_MEAN:
+      g_free (self->model_mean);
+      self->model_mean = g_value_dup_string (value);
+      if (self->model_mean)
+        GST_WARNING_OBJECT (object, "model-mean is not yet implemented; "
+            "normalization will be supported in a future HAL version");
+      break;
+    case PROP_MODEL_STD:
+      g_free (self->model_std);
+      self->model_std = g_value_dup_string (value);
+      if (self->model_std)
+        GST_WARNING_OBJECT (object, "model-std is not yet implemented; "
+            "normalization will be supported in a future HAL version");
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -678,6 +914,12 @@ edgefirst_camera_adaptor_get_property (GObject *object, guint prop_id,
       break;
     case PROP_LETTERBOX_RIGHT:
       g_value_set_int (value, self->lb_right);
+      break;
+    case PROP_MODEL_MEAN:
+      g_value_set_string (value, self->model_mean);
+      break;
+    case PROP_MODEL_STD:
+      g_value_set_string (value, self->model_std);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -777,8 +1019,12 @@ edgefirst_camera_adaptor_transform_caps (GstBaseTransform *trans,
       result = gst_caps_from_string (
           "other/tensors, num_tensors=(int)1, format=(string)static");
     } else {
-      guint channels = (self->colorspace ==
-          EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY) ? 1 : 3;
+      guint channels;
+      switch (self->colorspace) {
+        case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY: channels = 1; break;
+        case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_RGBA: channels = 4; break;
+        default:                                        channels = 3; break;
+      }
       const char *type_str = dtype_to_nnstreamer_string (self->dtype);
 
       /* NNStreamer dimensions: innermost-to-outermost */
@@ -942,8 +1188,11 @@ edgefirst_camera_adaptor_set_caps (GstBaseTransform *trans,
   /* Resolve output dimensions */
   self->out_width = self->model_width > 0 ? self->model_width : src_w;
   self->out_height = self->model_height > 0 ? self->model_height : src_h;
-  self->out_channels = (self->colorspace ==
-      EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY) ? 1 : 3;
+  switch (self->colorspace) {
+    case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY: self->out_channels = 1; break;
+    case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_RGBA: self->out_channels = 4; break;
+    default:                                        self->out_channels = 3; break;
+  }
 
   /* Resolve target HAL format/dtype from properties */
   resolve_target_format (self);
@@ -988,15 +1237,19 @@ edgefirst_camera_adaptor_transform_size (GstBaseTransform *trans,
         if (h == 0) h = self->model_height > 0 ? self->model_height :
             (guint) GST_VIDEO_INFO_HEIGHT (&info);
       }
-      if (c == 0)
-        c = (self->colorspace ==
-            EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY) ? 1 : 3;
+      if (c == 0) {
+        switch (self->colorspace) {
+          case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY: c = 1; break;
+          case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_RGBA: c = 4; break;
+          default:                                        c = 3; break;
+        }
+      }
     }
 
     if (w == 0 || h == 0)
       return FALSE;
 
-    *othersize = w * h * c;
+    *othersize = (gsize) w * h * c * dtype_byte_size (self->dtype);
     return TRUE;
   }
 
@@ -1187,7 +1440,13 @@ edgefirst_camera_adaptor_transform (GstBaseTransform *trans,
   EdgefirstCameraAdaptor *self = EDGEFIRST_CAMERA_ADAPTOR (trans);
   guint64 t0 = _get_time_ns ();
 
+  /* Try DMA-BUF zero-copy import first; fall back to memcpy for system memory */
+  gboolean src_owned = FALSE;
   hal_tensor *src = lookup_or_import_input (self, inbuf);
+  if (!src) {
+    src = create_input_from_sysmem (self, inbuf);
+    src_owned = TRUE;
+  }
   if (!src) {
     GST_ERROR_OBJECT (self, "failed to get input tensor");
     return GST_FLOW_ERROR;
@@ -1196,6 +1455,7 @@ edgefirst_camera_adaptor_transform (GstBaseTransform *trans,
   hal_tensor *dst = get_output_tensor (self, outbuf);
   if (!dst) {
     GST_ERROR_OBJECT (self, "failed to get output tensor");
+    if (src_owned) hal_tensor_free (src);
     return GST_FLOW_ERROR;
   }
 
@@ -1203,9 +1463,28 @@ edgefirst_camera_adaptor_transform (GstBaseTransform *trans,
       HAL_ROTATION_NONE, HAL_FLIP_NONE,
       self->crop_valid ? &self->crop : NULL);
 
+  if (src_owned) hal_tensor_free (src);
+
   if (ret != 0) {
     GST_ERROR_OBJECT (self, "hal_image_processor_convert failed (%d)", ret);
     return GST_FLOW_ERROR;
+  }
+
+  /* When using HAL-owned output (no downstream DMA-BUF pool), the convert
+   * wrote into self->hal_output, not outbuf. Copy the result out. */
+  if (!self->downstream_pool && self->hal_output) {
+    struct hal_tensor_map *tmap = hal_tensor_map_create (self->hal_output);
+    if (tmap) {
+      GstMapInfo map;
+      if (gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
+        gsize copy_size = MIN (map.size,
+            (gsize) self->out_width * self->out_height * self->out_channels
+            * dtype_byte_size (self->dtype));
+        memcpy (map.data, hal_tensor_map_data_const (tmap), copy_size);
+        gst_buffer_unmap (outbuf, &map);
+      }
+      hal_tensor_map_unmap (tmap);
+    }
   }
 
   gst_buffer_copy_into (outbuf, inbuf,
@@ -1316,6 +1595,18 @@ edgefirst_camera_adaptor_class_init (EdgefirstCameraAdaptorClass *klass)
           "set to override for non-centered placement.",
           0, G_MAXINT, 0,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_MODEL_MEAN,
+      g_param_spec_string ("model-mean", "Model Mean",
+          "Per-channel mean for float normalization (comma-separated, e.g. "
+          "\"0.485,0.456,0.406\")",
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_MODEL_STD,
+      g_param_spec_string ("model-std", "Model Std",
+          "Per-channel standard deviation for float normalization "
+          "(comma-separated, e.g. \"0.229,0.224,0.225\")",
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /* Element metadata */
   gst_element_class_set_static_metadata (element_class,

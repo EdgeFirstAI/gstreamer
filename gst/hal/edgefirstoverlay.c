@@ -19,6 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 
 /* hal_image_processor_draw_decoded_masks was added in HAL 0.15.0.
  * Declare weak so the plugin still loads against older library versions;
@@ -55,6 +56,14 @@ extern void hal_proto_data_free (struct hal_proto_data *proto) __attribute__((we
 GST_DEBUG_CATEGORY_STATIC (edgefirst_overlay_debug);
 #define GST_CAT_DEFAULT edgefirst_overlay_debug
 
+static inline guint64
+_get_time_ns (void)
+{
+  struct timespec ts;
+  clock_gettime (CLOCK_MONOTONIC, &ts);
+  return (guint64) ts.tv_sec * 1000000000ULL + (guint64) ts.tv_nsec;
+}
+
 /* ── Property IDs ────────────────────────────────────────────────── */
 
 enum {
@@ -71,6 +80,40 @@ enum {
   PROP_OPACITY,
   PROP_COLOR_MODE,
   PROP_CLASS_COLORS,
+  PROP_COMPUTE,
+};
+
+/* Compute backend enum — mirrors EdgefirstCameraAdaptorCompute for consistency */
+typedef enum {
+  OVERLAY_COMPUTE_AUTO,
+  OVERLAY_COMPUTE_OPENGL,
+  OVERLAY_COMPUTE_G2D,
+  OVERLAY_COMPUTE_CPU,
+} OverlayCompute;
+
+static GType
+overlay_compute_get_type (void)
+{
+  static GType type = 0;
+  if (g_once_init_enter (&type)) {
+    static const GEnumValue values[] = {
+      { OVERLAY_COMPUTE_AUTO, "Auto (HAL default)", "auto" },
+      { OVERLAY_COMPUTE_OPENGL, "OpenGL", "opengl" },
+      { OVERLAY_COMPUTE_G2D, "G2D", "g2d" },
+      { OVERLAY_COMPUTE_CPU, "CPU", "cpu" },
+      { 0, NULL, NULL },
+    };
+    GType t = g_enum_register_static ("EdgefirstOverlayCompute", values);
+    g_once_init_leave (&type, t);
+  }
+  return type;
+}
+
+static const enum hal_compute_backend overlay_compute_map[] = {
+  [OVERLAY_COMPUTE_AUTO]   = HAL_COMPUTE_BACKEND_AUTO,
+  [OVERLAY_COMPUTE_OPENGL] = HAL_COMPUTE_BACKEND_OPENGL,
+  [OVERLAY_COMPUTE_G2D]    = HAL_COMPUTE_BACKEND_G2D,
+  [OVERLAY_COMPUTE_CPU]    = HAL_COMPUTE_BACKEND_CPU,
 };
 
 /* ── Signal IDs ──────────────────────────────────────────────────── */
@@ -134,6 +177,7 @@ struct _EdgefirstOverlay {
   gfloat     opacity;
   EdgeFirstColorMode color_mode;
   gchar     *class_colors;
+  OverlayCompute compute;
 };
 
 /* ── Pad templates ───────────────────────────────────────────────── */
@@ -251,6 +295,13 @@ edgefirst_overlay_class_init (EdgefirstOverlayClass *klass)
       g_param_spec_string ("class-colors", "Class Colors",
           "Comma-separated RGBA hex values per class, e.g. \"FF0000FF,00FF00FF\"",
           NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_COMPUTE,
+      g_param_spec_enum ("compute", "Compute Backend",
+          "HAL image processing backend (auto, opengl, g2d, cpu)",
+          overlay_compute_get_type (),
+          OVERLAY_COMPUTE_AUTO,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /* new-detection signal */
   signals[SIGNAL_NEW_DETECTION] = g_signal_new ("new-detection",
@@ -377,6 +428,9 @@ edgefirst_overlay_set_property (GObject *object, guint prop_id,
       g_free (self->class_colors);
       self->class_colors = g_value_dup_string (value);
       break;
+    case PROP_COMPUTE:
+      self->compute = (OverlayCompute) g_value_get_enum (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
@@ -401,6 +455,7 @@ edgefirst_overlay_get_property (GObject *object, guint prop_id,
     case PROP_OPACITY:            g_value_set_float   (value, self->opacity);             break;
     case PROP_COLOR_MODE:         g_value_set_enum    (value, (gint) self->color_mode);   break;
     case PROP_CLASS_COLORS:       g_value_set_string  (value, self->class_colors);        break;
+    case PROP_COMPUTE:            g_value_set_enum    (value, (gint) self->compute);      break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec); break;
   }
 }
@@ -439,12 +494,20 @@ gst_format_to_hal (GstVideoFormat fmt)
 static gboolean
 overlay_start (EdgefirstOverlay *self)
 {
-  self->processor = hal_image_processor_new ();
+  enum hal_compute_backend backend = overlay_compute_map[self->compute];
+  if (backend == HAL_COMPUTE_BACKEND_AUTO)
+    self->processor = hal_image_processor_new ();
+  else
+    self->processor = hal_image_processor_new_with_backend (backend);
   if (!self->processor) {
     GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
         ("Failed to create HAL image processor: %s", strerror (errno)), (NULL));
     return FALSE;
   }
+  GST_INFO_OBJECT (self, "HAL image processor created (compute=%s)",
+      self->compute == OVERLAY_COMPUTE_AUTO ? "auto" :
+      self->compute == OVERLAY_COMPUTE_OPENGL ? "opengl" :
+      self->compute == OVERLAY_COMPUTE_G2D ? "g2d" : "cpu");
 
   if (self->model_config) {
     struct hal_decoder_params *params = hal_decoder_params_new ();
@@ -550,21 +613,33 @@ nnstreamer_type_to_hal (const gchar *type_str)
   return HAL_DTYPE_F32;
 }
 
-/* Parse NNStreamer dim string "C:W:H:1" (innermost first) to shape[] (row-major).
- * Returns ndim, fills shape[0..ndim-1] in row-major order (outermost first). */
+/* Parse NNStreamer dim string "C:W:H:B" (innermost first) to shape[] (row-major).
+ * Returns ndim, fills shape[0..ndim-1] in row-major order (outermost first).
+ * Strips trailing :1 dimensions, then squeezes interior unit dimensions
+ * (keeps min 2 dims). This handles Ara-2 DVM output like "32:1:8400:1"
+ * → [8400, 32] instead of [8400, 1, 32]. */
 static size_t
 parse_nnstreamer_dims (const gchar *dim_str, size_t *shape, size_t max_ndim)
 {
   gchar **parts = g_strsplit (dim_str, ":", (gint) max_ndim + 1);
   size_t n = 0;
   while (parts[n] && n < max_ndim) n++;
-  /* Strip trailing :1 dimensions */
+  /* Strip trailing :1 dimensions (outermost batch dims) */
   while (n > 1 && g_strcmp0 (parts[n - 1], "1") == 0) n--;
   /* NNStreamer: innermost first → reverse to row-major */
-  for (size_t i = 0; i < n; i++)
-    shape[i] = (size_t) g_ascii_strtoull (parts[n - 1 - i], NULL, 10);
+  size_t raw[8];
+  for (size_t i = 0; i < n && i < 8; i++)
+    raw[i] = (size_t) g_ascii_strtoull (parts[n - 1 - i], NULL, 10);
   g_strfreev (parts);
-  return n;
+  /* Squeeze interior unit (=1) dimensions, keeping at least 2 dims */
+  size_t out = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (raw[i] != 1 || out == 0)
+      shape[out++] = raw[i];
+  }
+  if (out < 2 && n >= 2)
+    shape[out++] = 1;
+  return out;
 }
 
 static gboolean
@@ -623,21 +698,60 @@ overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
   hal_decoder_params_set_decoder_version (params, parse_decoder_version (self->decoder_version));
 
   for (gint i = 0; i < num_tensors && i < 16; i++) {
-    size_t *shape  = shapes[i];
     size_t  ndim   = ndims[i];
     enum hal_dtype dtype = nnstreamer_type_to_hal (type_parts[i]);
+
+    /* Work with a local copy so we can rearrange for the HAL API.
+     * After squeeze, 2D shapes are [num_boxes, features].
+     * HAL expects [1, features, num_boxes] for split outputs,
+     * and protos must be 4D [1, C, H, W]. */
+    size_t out_shape[MAX_NDIM] = {0};
+    memcpy (out_shape, shapes[i], ndim * sizeof (size_t));
 
     enum HalOutputType  type;
     enum HalDimName     dims[MAX_NDIM];
 
     if (ndim == 3) {
-      /* NNStreamer "C:W:H:1" → strip :1 → row-major [H,W,C], ndim=3 */
+      /* Protos: squeezed [H, W, C] → HAL [1, C, H, W] (4D) */
+      size_t H = out_shape[0], W = out_shape[1], C = out_shape[2];
+      out_shape[0] = 1;
+      out_shape[1] = C;
+      out_shape[2] = H;
+      out_shape[3] = W;
       type    = HAL_OUTPUT_TYPE_PROTOS;
-      dims[0] = HAL_DIM_NAME_HEIGHT;
-      dims[1] = HAL_DIM_NAME_WIDTH;
-      dims[2] = HAL_DIM_NAME_NUM_PROTOS;
+      dims[0] = HAL_DIM_NAME_BATCH;
+      dims[1] = HAL_DIM_NAME_NUM_PROTOS;
+      dims[2] = HAL_DIM_NAME_HEIGHT;
+      dims[3] = HAL_DIM_NAME_WIDTH;
+      ndim    = 4;
+    } else if (has_split_boxes && ndim == 2) {
+      /* 2D [num_boxes, features] → HAL [1, features, num_boxes] */
+      size_t num_boxes = out_shape[0];
+      size_t feat_dim  = out_shape[1];
+      out_shape[0] = 1;
+      out_shape[1] = feat_dim;
+      out_shape[2] = num_boxes;
+      ndim = 3;
+
+      if (feat_dim == 4) {
+        type    = HAL_OUTPUT_TYPE_BOXES;
+        dims[0] = HAL_DIM_NAME_BATCH;
+        dims[1] = HAL_DIM_NAME_BOX_COORDS;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+      } else if (has_protos && proto_channels > 0 && feat_dim == proto_channels) {
+        type    = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
+        dims[0] = HAL_DIM_NAME_BATCH;
+        dims[1] = HAL_DIM_NAME_NUM_PROTOS;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+      } else {
+        type    = HAL_OUTPUT_TYPE_SCORES;
+        dims[0] = HAL_DIM_NAME_BATCH;
+        dims[1] = HAL_DIM_NAME_NUM_CLASSES;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+      }
     } else if (has_split_boxes) {
-      size_t feat_dim = shape[1];
+      /* 3D+ split tensor — original TFLite path (no squeeze needed) */
+      size_t feat_dim = out_shape[1];
       if (feat_dim == 4) {
         type    = HAL_OUTPUT_TYPE_BOXES;
         dims[0] = HAL_DIM_NAME_BATCH;
@@ -660,21 +774,18 @@ overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
     } else {
       type    = HAL_OUTPUT_TYPE_DETECTION;
       if (ndim >= 3) {
-        /* shape [batch, boxes, features] */
         dims[0] = HAL_DIM_NAME_BATCH;
         dims[1] = HAL_DIM_NAME_NUM_BOXES;
         dims[2] = HAL_DIM_NAME_NUM_FEATURES;
         ndim    = 3;
       } else {
-        /* batch stripped: shape [boxes, features] */
         dims[0] = HAL_DIM_NAME_NUM_BOXES;
         dims[1] = HAL_DIM_NAME_NUM_FEATURES;
-        /* ndim stays as-is (2) */
       }
     }
 
     gint idx = hal_decoder_params_add_output (params, type,
-        HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, ndim);
+        HAL_DECODER_TYPE_ULTRALYTICS, out_shape, dims, ndim);
 
     if (dtype != HAL_DTYPE_F32 && idx >= 0) {
       hal_decoder_params_output_set_quantization (params, idx, 1.0f, 0);
@@ -808,8 +919,13 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
   }
 
   /* System-memory path: allocate HAL image and copy frame data into it */
+  guint64 t0_input = _get_time_ns ();
   hal_tensor *tensor = hal_image_processor_create_image (self->processor,
       (size_t) width, (size_t) height, pixel_fmt, HAL_DTYPE_U8);
+  guint64 t1_input = _get_time_ns ();
+  GST_INFO_OBJECT (self, "hal_image_processor_create_image (input %zux%zu fmt=%d) "
+      "took %.1f ms", (size_t) width, (size_t) height, pixel_fmt,
+      (t1_input - t0_input) / 1e6);
   if (!tensor)
     return NULL;
 
@@ -891,9 +1007,14 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
   }
 
   hal_tensor_free (self->display_image);
+  guint64 t0_display = _get_time_ns ();
   self->display_image = hal_image_processor_create_image (self->processor,
       (size_t) self->display_w, (size_t) self->display_h,
       HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+  guint64 t1_display = _get_time_ns ();
+  GST_INFO_OBJECT (self, "hal_image_processor_create_image (display %ux%u RGBA) "
+      "took %.1f ms", self->display_w, self->display_h,
+      (t1_display - t0_display) / 1e6);
   if (!self->display_image) {
     GST_ERROR_OBJECT (self, "Failed to allocate display image (%ux%u)",
         self->display_w, self->display_h);
@@ -1076,8 +1197,12 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
     return GST_FLOW_ERROR;
   }
 
+  guint64 t0_convert = _get_time_ns ();
   int convert_ret = hal_image_processor_convert (self->processor, src_img,
       self->display_image, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
+  guint64 t1_convert = _get_time_ns ();
+  GST_INFO_OBJECT (self, "hal_image_processor_convert took %.1f ms",
+      (t1_convert - t0_convert) / 1e6);
   hal_tensor_free (src_img);
 
   if (convert_ret != 0) {
