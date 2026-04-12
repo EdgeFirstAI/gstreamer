@@ -21,6 +21,10 @@
 #include <errno.h>
 #include <time.h>
 
+#if HAVE_NNSTREAMER
+#include <nnstreamer_tensor_quant_meta.h>
+#endif
+
 /* hal_image_processor_draw_decoded_masks was added in HAL 0.15.0.
  * Declare weak so the plugin still loads against older library versions;
  * the video chain guards the call with a NULL check at runtime. */
@@ -189,9 +193,12 @@ struct _EdgefirstOverlay {
   size_t   tensor_shapes[16][8];
   size_t   hal_ndims[16];
   size_t   hal_shapes[16][8];
+  enum HalOutputType tensor_types[16];
   gint     tensor_count;
   enum hal_dtype tensor_dtypes[16];
   gboolean caps_parsed;           /* TRUE after tensors CAPS event parsed */
+  gboolean has_split_boxes;
+  gboolean has_protos;
 
   /* Properties */
   gchar     *model_config;
@@ -691,8 +698,11 @@ parse_nnstreamer_dims (const gchar *dim_str, size_t *shape, size_t max_ndim)
   return out;
 }
 
+/* Phase 1: Parse tensor caps and compute HAL-convention shapes.
+ * Called from CAPS event on the tensors pad. Does NOT create the decoder
+ * because quantization metadata is only available on the first buffer. */
 static gboolean
-overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
+overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
 {
   GstStructure *s = gst_caps_get_structure (caps, 0);
   gint num_tensors = 0;
@@ -715,42 +725,25 @@ overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
   gboolean has_protos      = FALSE;
   size_t   proto_channels  = 0;
   gboolean has_split_boxes = FALSE;
-  size_t shapes[16][MAX_NDIM];
-  size_t ndims[16];
 
-  for (gint i = 0; i < num_tensors && i < 16; i++) {
-    ndims[i] = parse_nnstreamer_dims (dim_parts[i], shapes[i], MAX_NDIM);
-    if (ndims[i] == 3) {
+  self->tensor_count = (num_tensors < 16) ? num_tensors : 16;
+
+  for (gint i = 0; i < self->tensor_count; i++) {
+    self->tensor_ndims[i] = parse_nnstreamer_dims (dim_parts[i],
+        self->tensor_shapes[i], MAX_NDIM);
+    self->tensor_dtypes[i] = nnstreamer_type_to_hal (type_parts[i]);
+
+    if (self->tensor_ndims[i] == 3) {
       has_protos = TRUE;
-      /* NNStreamer "C:W:H:1" → strip :1 → row-major [H,W,C]: channels = shapes[i][2] */
-      proto_channels = shapes[i][2];
-    } else if (ndims[i] >= 2) {
-      size_t feat_dim = shapes[i][1];  /* row-major: [batch, features, boxes] */
-      if (feat_dim == 4)
+      proto_channels = self->tensor_shapes[i][2];
+    } else if (self->tensor_ndims[i] >= 2) {
+      if (self->tensor_shapes[i][1] == 4)
         has_split_boxes = TRUE;
     }
   }
 
-  /* Cache NNStreamer-parsed shapes for reference, and compute
-   * HAL-convention shapes for tensor creation in the chain function.
-   * The HAL decoder config uses the rearranged shapes (with batch dim,
-   * transposed where needed), and the tensor chain must create HAL tensors
-   * with the SAME shapes so find_outputs_with_shape matches. */
-  self->tensor_count = (num_tensors < 16) ? num_tensors : 16;
-  for (gint i = 0; i < self->tensor_count; i++) {
-    self->tensor_ndims[i] = ndims[i];
-    self->tensor_dtypes[i] = nnstreamer_type_to_hal (type_parts[i]);
-    for (size_t j = 0; j < ndims[i] && j < 8; j++)
-      self->tensor_shapes[i][j] = shapes[i][j];
-  }
-  self->caps_parsed = TRUE;
-
-  /* ── Pass 2: build decoder params ───────────────────────────── */
-  struct hal_decoder_params *params = hal_decoder_params_new ();
-  hal_decoder_params_set_score_threshold (params, self->score_threshold);
-  hal_decoder_params_set_iou_threshold   (params, self->iou_threshold);
-  hal_decoder_params_set_decoder_version (params, parse_decoder_version (self->decoder_version));
-  hal_decoder_params_set_nms (params, HAL_NMS_CLASS_AGNOSTIC);
+  /* ── Pass 2: compute HAL-convention shapes and output types ──── */
+  /* Track per-tensor output type for quant application later */
 
   static const char *type_names[] = {
     [HAL_OUTPUT_TYPE_DETECTION]         = "DETECTION",
@@ -760,139 +753,171 @@ overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
     [HAL_OUTPUT_TYPE_PROTOS]            = "PROTOS",
   };
 
-  for (gint i = 0; i < num_tensors && i < 16; i++) {
-    size_t  ndim   = ndims[i];
-    enum hal_dtype dtype = nnstreamer_type_to_hal (type_parts[i]);
-
-    /* Work with a local copy so we can rearrange for the HAL API.
-     * After squeeze, 2D shapes are [num_boxes, features].
-     * HAL expects [1, features, num_boxes] for split outputs,
-     * and protos must be 4D [1, C, H, W]. */
+  for (gint i = 0; i < self->tensor_count; i++) {
+    size_t ndim = self->tensor_ndims[i];
     size_t out_shape[MAX_NDIM] = {0};
-    memcpy (out_shape, shapes[i], ndim * sizeof (size_t));
+    memcpy (out_shape, self->tensor_shapes[i], ndim * sizeof (size_t));
 
-    enum HalOutputType  type;
-    enum HalDimName     dims[MAX_NDIM];
+    enum HalOutputType type;
 
     if (ndim == 3) {
       /* Protos: squeezed [H, W, C] → HAL [1, C, H, W] (4D) */
       size_t H = out_shape[0], W = out_shape[1], C = out_shape[2];
-      out_shape[0] = 1;
-      out_shape[1] = C;
-      out_shape[2] = H;
-      out_shape[3] = W;
-      type    = HAL_OUTPUT_TYPE_PROTOS;
-      dims[0] = HAL_DIM_NAME_BATCH;
-      dims[1] = HAL_DIM_NAME_NUM_PROTOS;
-      dims[2] = HAL_DIM_NAME_HEIGHT;
-      dims[3] = HAL_DIM_NAME_WIDTH;
-      ndim    = 4;
+      out_shape[0] = 1; out_shape[1] = C; out_shape[2] = H; out_shape[3] = W;
+      type = HAL_OUTPUT_TYPE_PROTOS;
+      ndim = 4;
     } else if (has_split_boxes && ndim == 2) {
-      /* 2D [num_boxes, features] → HAL [1, features, num_boxes] */
-      size_t num_boxes = out_shape[0];
-      size_t feat_dim  = out_shape[1];
-      out_shape[0] = 1;
-      out_shape[1] = feat_dim;
-      out_shape[2] = num_boxes;
+      size_t nb = out_shape[0], nf = out_shape[1];
+      out_shape[0] = 1; out_shape[1] = nf; out_shape[2] = nb;
       ndim = 3;
-
-      if (feat_dim == 4) {
-        type    = HAL_OUTPUT_TYPE_BOXES;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_BOX_COORDS;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-      } else if (has_protos && proto_channels > 0 && feat_dim == proto_channels) {
-        type    = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_PROTOS;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-      } else {
-        type    = HAL_OUTPUT_TYPE_SCORES;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_CLASSES;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-      }
-    } else if (has_split_boxes) {
-      /* 3D+ split tensor — original TFLite path (no squeeze needed) */
-      size_t feat_dim = out_shape[1];
-      if (feat_dim == 4) {
-        type    = HAL_OUTPUT_TYPE_BOXES;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_BOX_COORDS;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-        ndim    = 3;
-      } else if (has_protos && proto_channels > 0 && feat_dim == proto_channels) {
-        type    = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_PROTOS;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-        ndim    = 3;
-      } else {
-        type    = HAL_OUTPUT_TYPE_SCORES;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_CLASSES;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-        ndim    = 3;
-      }
+      if (nf == 4) type = HAL_OUTPUT_TYPE_BOXES;
+      else if (has_protos && proto_channels > 0 && nf == proto_channels)
+        type = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
+      else type = HAL_OUTPUT_TYPE_SCORES;
+    } else if (has_split_boxes && ndim >= 3) {
+      size_t nf = out_shape[1];
+      ndim = 3;
+      if (nf == 4) type = HAL_OUTPUT_TYPE_BOXES;
+      else if (has_protos && proto_channels > 0 && nf == proto_channels)
+        type = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
+      else type = HAL_OUTPUT_TYPE_SCORES;
     } else {
-      /* Fused detection tensor — always needs 3D [1, features, boxes].
-       * HAL decoder's verify_yolo_seg_det requires ndim == 3. */
+      /* Fused detection — always 3D [1, features, boxes] */
       type = HAL_OUTPUT_TYPE_DETECTION;
-      if (ndim >= 3) {
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_FEATURES;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-        ndim    = 3;
-      } else {
-        /* 2D [num_boxes, features] → [1, features, num_boxes] */
+      if (ndim < 3) {
         size_t nb = out_shape[0], nf = out_shape[1];
-        out_shape[0] = 1;
-        out_shape[1] = nf;
-        out_shape[2] = nb;
-        dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_FEATURES;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
-        ndim    = 3;
+        out_shape[0] = 1; out_shape[1] = nf; out_shape[2] = nb;
       }
+      ndim = 3;
     }
 
-    /* Store HAL-convention shape for tensor creation in chain function */
-    if (i < 16) {
-      self->hal_ndims[i] = ndim;
-      for (size_t j = 0; j < ndim && j < 8; j++)
-        self->hal_shapes[i][j] = out_shape[j];
-    }
+    self->hal_ndims[i] = ndim;
+    self->tensor_types[i] = type;
+    for (size_t j = 0; j < ndim && j < 8; j++)
+      self->hal_shapes[i][j] = out_shape[j];
 
-    gint idx = hal_decoder_params_add_output (params, type,
-        HAL_DECODER_TYPE_ULTRALYTICS, out_shape, dims, ndim);
-
-    /* Mark boxes/detection outputs as normalized.
-     * When normalized=auto (default), YOLOv8 Ultralytics outputs are assumed
-     * normalized [0,1]. Override with normalized=true|false property, or
-     * use model-config (edgefirst.json) which carries the flag explicitly. */
-    if (idx >= 0 && (type == HAL_OUTPUT_TYPE_BOXES || type == HAL_OUTPUT_TYPE_DETECTION)) {
-      gboolean is_norm = (self->normalized_prop != OVERLAY_NORMALIZED_FALSE);
-      hal_decoder_params_output_set_normalized (params, idx, is_norm ? 1 : 0);
-    }
-
-    if (dtype != HAL_DTYPE_F32 && idx >= 0) {
-      hal_decoder_params_output_set_quantization (params, idx, 1.0f, 0);
-    }
-
-    {
-      gchar shape_str[128];
-      gint pos = g_snprintf (shape_str, sizeof (shape_str), "[%zu", out_shape[0]);
-      for (size_t j = 1; j < ndim && pos < (gint) sizeof (shape_str) - 8; j++)
-        pos += g_snprintf (shape_str + pos, sizeof (shape_str) - pos, ",%zu", out_shape[j]);
-      g_strlcat (shape_str, "]", sizeof (shape_str));
-      GST_INFO_OBJECT (self, "  [%d] %-11s ndim=%zu dtype=%d shape=%s",
-          i, (type <= HAL_OUTPUT_TYPE_PROTOS) ? type_names[type] : "?",
-          ndim, dtype, shape_str);
-    }
+    gchar shape_str[128];
+    gint pos = g_snprintf (shape_str, sizeof (shape_str), "[%zu", out_shape[0]);
+    for (size_t j = 1; j < ndim && pos < (gint) sizeof (shape_str) - 8; j++)
+      pos += g_snprintf (shape_str + pos, sizeof (shape_str) - pos, ",%zu", out_shape[j]);
+    g_strlcat (shape_str, "]", sizeof (shape_str));
+    GST_INFO_OBJECT (self, "  [%d] %-11s ndim=%zu dtype=%d shape=%s",
+        i, (type <= HAL_OUTPUT_TYPE_PROTOS) ? type_names[type] : "?",
+        ndim, self->tensor_dtypes[i], shape_str);
   }
+
+  self->has_split_boxes = has_split_boxes;
+  self->has_protos = has_protos;
 
   g_strfreev (dim_parts);
   g_strfreev (type_parts);
+
+  self->caps_parsed = TRUE;
+  GST_INFO_OBJECT (self, "parsed tensor caps: %d tensors, has_split=%d, has_protos=%d",
+      self->tensor_count, has_split_boxes, has_protos);
+  return TRUE;
+}
+
+/* Phase 2: Create the HAL decoder from cached shapes + quant params from buffer.
+ * Called from the first tensor chain invocation where the buffer is available
+ * for GstNnsTensorQuantMeta extraction. */
+static gboolean
+overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
+{
+  struct hal_decoder_params *params = hal_decoder_params_new ();
+  hal_decoder_params_set_score_threshold (params, self->score_threshold);
+  hal_decoder_params_set_iou_threshold   (params, self->iou_threshold);
+  hal_decoder_params_set_decoder_version (params, parse_decoder_version (self->decoder_version));
+  hal_decoder_params_set_nms (params, HAL_NMS_CLASS_AGNOSTIC);
+
+  /* Infer model input size from protos spatial dims (160*4=640) or model_width property */
+  guint model_input_size = self->model_width > 0 ? self->model_width : 640;
+  for (gint i = 0; i < self->tensor_count; i++) {
+    if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS && self->hal_ndims[i] == 4) {
+      guint inferred = (guint) self->hal_shapes[i][2] * 4;  /* proto H * stride */
+      if (inferred > 0 && self->model_width == 0) {
+        model_input_size = inferred;
+        GST_INFO_OBJECT (self, "inferred model input size %u from protos", model_input_size);
+      }
+      break;
+    }
+  }
+
+  /* Extract quantization parameters from buffer if available */
+#if HAVE_NNSTREAMER
+  GstNnsTensorQuantMeta *qm = gst_buffer_get_nns_tensor_quant_meta (buf);
+#else
+  void *qm = NULL;
+#endif
+
+  gint boxes_idx = -1;  /* track which decoder output is boxes/detection */
+
+  for (gint i = 0; i < self->tensor_count; i++) {
+    enum HalOutputType type = self->tensor_types[i];
+    size_t ndim = self->hal_ndims[i];
+
+    /* Build dim names from type */
+    enum HalDimName dims[MAX_NDIM];
+    switch (type) {
+      case HAL_OUTPUT_TYPE_PROTOS:
+        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_NUM_PROTOS;
+        dims[2] = HAL_DIM_NAME_HEIGHT; dims[3] = HAL_DIM_NAME_WIDTH;
+        break;
+      case HAL_OUTPUT_TYPE_BOXES:
+        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_BOX_COORDS;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+        break;
+      case HAL_OUTPUT_TYPE_MASK_COEFFICIENTS:
+        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_NUM_PROTOS;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+        break;
+      case HAL_OUTPUT_TYPE_SCORES:
+        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_NUM_CLASSES;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+        break;
+      default: /* DETECTION */
+        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_NUM_FEATURES;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+        break;
+    }
+
+    gint idx = hal_decoder_params_add_output (params, type,
+        HAL_DECODER_TYPE_ULTRALYTICS, self->hal_shapes[i], dims, ndim);
+
+    if (idx >= 0 && (type == HAL_OUTPUT_TYPE_BOXES || type == HAL_OUTPUT_TYPE_DETECTION)) {
+      gboolean is_norm = (self->normalized_prop != OVERLAY_NORMALIZED_FALSE);
+      hal_decoder_params_output_set_normalized (params, idx, is_norm ? 1 : 0);
+      boxes_idx = idx;
+    }
+
+    /* Set quantization: prefer actual quant meta, fall back to identity */
+    if (self->tensor_dtypes[i] != HAL_DTYPE_F32 && idx >= 0) {
+      gfloat scale = 1.0f;
+      gint   zp    = 0;
+
+#if HAVE_NNSTREAMER
+      if (qm && (guint) i < qm->num_tensors) {
+        const NnsTensorQuantInfo *qi = &qm->quant[i];
+        if (qi->scheme != NNS_QUANT_NONE && qi->num_params > 0) {
+          scale = (gfloat) qi->scales[0];
+          zp    = (gint) qi->zero_points[0];
+          GST_DEBUG_OBJECT (self, "  [%d] quant from meta: scale=%g zp=%d", i, scale, zp);
+        }
+      }
+#endif
+
+      /* For boxes, scale must account for model input size to normalize
+       * pixel-space coordinates to [0,1]. See yolov8n_seg_ara2.cpp:273 */
+      if ((type == HAL_OUTPUT_TYPE_BOXES || type == HAL_OUTPUT_TYPE_DETECTION)
+          && model_input_size > 0 && scale != 1.0f) {
+        scale /= (gfloat) model_input_size;
+        GST_DEBUG_OBJECT (self, "  [%d] boxes scale adjusted by /%u → %g",
+            i, model_input_size, scale);
+      }
+
+      hal_decoder_params_output_set_quantization (params, idx, scale, zp);
+    }
+  }
 
   self->decoder = hal_decoder_new (params);
   hal_decoder_params_free (params);
@@ -901,16 +926,17 @@ overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
     GST_WARNING_OBJECT (self,
         "auto-config decoder creation failed (%s); running in pass-through mode",
         strerror (errno));
-    return TRUE;  /* not fatal */
+    return FALSE;
   }
 
   if (self->normalized_prop == OVERLAY_NORMALIZED_AUTO)
     self->normalized = hal_decoder_normalized_boxes (self->decoder);
   else
     self->normalized = (self->normalized_prop == OVERLAY_NORMALIZED_TRUE);
-  GST_INFO_OBJECT (self, "auto-configured decoder from tensor caps "
-      "(%d tensors, has_split=%d, has_protos=%d, normalized=%d)",
-      num_tensors, has_split_boxes, has_protos, self->normalized);
+
+  GST_INFO_OBJECT (self, "decoder created: %d tensors, normalized=%d, "
+      "quant_meta=%s", self->tensor_count, self->normalized,
+      qm ? "yes" : "no");
   return TRUE;
 }
 
@@ -1204,9 +1230,10 @@ edgefirst_overlay_tensors_event (GstPad *pad G_GNUC_UNUSED,
     case GST_EVENT_CAPS: {
       GstCaps *caps;
       gst_event_parse_caps (event, &caps);
-      /* Auto-configure decoder from caps if no model-config was set */
-      if (!self->decoder)
-        overlay_auto_config_decoder (self, caps);
+      /* Parse tensor shapes from caps; decoder creation deferred to
+       * first buffer where quant meta is available. */
+      if (!self->caps_parsed && !self->decoder)
+        overlay_parse_tensor_caps (self, caps);
       gst_event_unref (event);
       return TRUE;
     }
@@ -1413,6 +1440,12 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
     GstObject *parent, GstBuffer *buf)
 {
   EdgefirstOverlay *self = EDGEFIRST_OVERLAY (parent);
+
+  /* Create decoder on first buffer if caps were parsed but decoder not yet built.
+   * This defers creation so we can extract GstNnsTensorQuantMeta from the buffer. */
+  if (!self->decoder && self->caps_parsed) {
+    overlay_create_decoder (self, buf);
+  }
 
   if (!self->decoder) {
     gst_buffer_unref (buf);
