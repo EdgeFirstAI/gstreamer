@@ -81,7 +81,32 @@ enum {
   PROP_COLOR_MODE,
   PROP_CLASS_COLORS,
   PROP_COMPUTE,
+  PROP_NORMALIZED,
 };
+
+/* Tri-state for normalized box coordinates */
+typedef enum {
+  OVERLAY_NORMALIZED_AUTO,    /* Infer from model-config or decoder version */
+  OVERLAY_NORMALIZED_TRUE,    /* Boxes in [0,1] range */
+  OVERLAY_NORMALIZED_FALSE,   /* Boxes in pixel coordinates */
+} OverlayNormalized;
+
+static GType
+overlay_normalized_get_type (void)
+{
+  static GType type = 0;
+  if (g_once_init_enter (&type)) {
+    static const GEnumValue values[] = {
+      { OVERLAY_NORMALIZED_AUTO, "Auto (infer from model config/decoder)", "auto" },
+      { OVERLAY_NORMALIZED_TRUE, "Normalized [0,1] coordinates", "true" },
+      { OVERLAY_NORMALIZED_FALSE, "Pixel coordinates", "false" },
+      { 0, NULL, NULL },
+    };
+    GType t = g_enum_register_static ("EdgefirstOverlayNormalized", values);
+    g_once_init_leave (&type, t);
+  }
+  return type;
+}
 
 /* Compute backend enum — mirrors EdgefirstCameraAdaptorCompute for consistency */
 typedef enum {
@@ -156,11 +181,17 @@ struct _EdgefirstOverlay {
   gboolean               flushing;
   gboolean               normalized;         /* TRUE if decoder outputs [0,1] coords */
 
-  /* Cached tensor shapes from CAPS event (for chain function) */
+  /* Cached tensor shapes from CAPS event (for chain function).
+   * tensor_shapes: NNStreamer-squeezed shapes (row-major after reversal).
+   * hal_shapes/hal_ndims: HAL-convention shapes used for tensor creation,
+   * including batch dim and any rearrangement done in auto-config. */
   size_t   tensor_ndims[16];
   size_t   tensor_shapes[16][8];
+  size_t   hal_ndims[16];
+  size_t   hal_shapes[16][8];
   gint     tensor_count;
   enum hal_dtype tensor_dtypes[16];
+  gboolean caps_parsed;           /* TRUE after tensors CAPS event parsed */
 
   /* Properties */
   gchar     *model_config;
@@ -178,6 +209,7 @@ struct _EdgefirstOverlay {
   EdgeFirstColorMode color_mode;
   gchar     *class_colors;
   OverlayCompute compute;
+  OverlayNormalized normalized_prop;  /* user-facing tri-state property */
 };
 
 /* ── Pad templates ───────────────────────────────────────────────── */
@@ -301,6 +333,14 @@ edgefirst_overlay_class_init (EdgefirstOverlayClass *klass)
           "HAL image processing backend (auto, opengl, g2d, cpu)",
           overlay_compute_get_type (),
           OVERLAY_COMPUTE_AUTO,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (obj_class, PROP_NORMALIZED,
+      g_param_spec_enum ("normalized", "Normalized Coordinates",
+          "Whether box coordinates are in normalized [0,1] range. "
+          "Auto infers from model-config or defaults to true for YOLOv8.",
+          overlay_normalized_get_type (),
+          OVERLAY_NORMALIZED_AUTO,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /* new-detection signal */
@@ -431,6 +471,9 @@ edgefirst_overlay_set_property (GObject *object, guint prop_id,
     case PROP_COMPUTE:
       self->compute = (OverlayCompute) g_value_get_enum (value);
       break;
+    case PROP_NORMALIZED:
+      self->normalized_prop = (OverlayNormalized) g_value_get_enum (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
@@ -456,6 +499,7 @@ edgefirst_overlay_get_property (GObject *object, guint prop_id,
     case PROP_COLOR_MODE:         g_value_set_enum    (value, (gint) self->color_mode);   break;
     case PROP_CLASS_COLORS:       g_value_set_string  (value, self->class_colors);        break;
     case PROP_COMPUTE:            g_value_set_enum    (value, (gint) self->compute);      break;
+    case PROP_NORMALIZED:         g_value_set_enum    (value, (gint) self->normalized_prop); break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec); break;
   }
 }
@@ -529,10 +573,15 @@ overlay_start (EdgefirstOverlay *self)
       self->processor = NULL;
       return FALSE;
     }
-    self->normalized = hal_decoder_normalized_boxes (self->decoder);
+    /* model-config provides normalized flag; property override takes precedence */
+    if (self->normalized_prop == OVERLAY_NORMALIZED_AUTO)
+      self->normalized = hal_decoder_normalized_boxes (self->decoder);
+    else
+      self->normalized = (self->normalized_prop == OVERLAY_NORMALIZED_TRUE);
   } else {
     self->decoder   = NULL;   /* deferred: auto-configure on tensors CAPS */
-    self->normalized = TRUE;
+    /* Default: YOLOv8 Ultralytics outputs normalized coords */
+    self->normalized = (self->normalized_prop != OVERLAY_NORMALIZED_FALSE);
   }
 
   g_mutex_init (&self->lock);
@@ -682,7 +731,11 @@ overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
     }
   }
 
-  /* Cache shapes for tensors_chain */
+  /* Cache NNStreamer-parsed shapes for reference, and compute
+   * HAL-convention shapes for tensor creation in the chain function.
+   * The HAL decoder config uses the rearranged shapes (with batch dim,
+   * transposed where needed), and the tensor chain must create HAL tensors
+   * with the SAME shapes so find_outputs_with_shape matches. */
   self->tensor_count = (num_tensors < 16) ? num_tensors : 16;
   for (gint i = 0; i < self->tensor_count; i++) {
     self->tensor_ndims[i] = ndims[i];
@@ -690,12 +743,22 @@ overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
     for (size_t j = 0; j < ndims[i] && j < 8; j++)
       self->tensor_shapes[i][j] = shapes[i][j];
   }
+  self->caps_parsed = TRUE;
 
   /* ── Pass 2: build decoder params ───────────────────────────── */
   struct hal_decoder_params *params = hal_decoder_params_new ();
   hal_decoder_params_set_score_threshold (params, self->score_threshold);
   hal_decoder_params_set_iou_threshold   (params, self->iou_threshold);
   hal_decoder_params_set_decoder_version (params, parse_decoder_version (self->decoder_version));
+  hal_decoder_params_set_nms (params, HAL_NMS_CLASS_AGNOSTIC);
+
+  static const char *type_names[] = {
+    [HAL_OUTPUT_TYPE_DETECTION]         = "DETECTION",
+    [HAL_OUTPUT_TYPE_BOXES]             = "BOXES",
+    [HAL_OUTPUT_TYPE_SCORES]            = "SCORES",
+    [HAL_OUTPUT_TYPE_MASK_COEFFICIENTS] = "MASK_COEFF",
+    [HAL_OUTPUT_TYPE_PROTOS]            = "PROTOS",
+  };
 
   for (gint i = 0; i < num_tensors && i < 16; i++) {
     size_t  ndim   = ndims[i];
@@ -772,23 +835,59 @@ overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
         ndim    = 3;
       }
     } else {
-      type    = HAL_OUTPUT_TYPE_DETECTION;
+      /* Fused detection tensor — always needs 3D [1, features, boxes].
+       * HAL decoder's verify_yolo_seg_det requires ndim == 3. */
+      type = HAL_OUTPUT_TYPE_DETECTION;
       if (ndim >= 3) {
         dims[0] = HAL_DIM_NAME_BATCH;
-        dims[1] = HAL_DIM_NAME_NUM_BOXES;
-        dims[2] = HAL_DIM_NAME_NUM_FEATURES;
+        dims[1] = HAL_DIM_NAME_NUM_FEATURES;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
         ndim    = 3;
       } else {
-        dims[0] = HAL_DIM_NAME_NUM_BOXES;
+        /* 2D [num_boxes, features] → [1, features, num_boxes] */
+        size_t nb = out_shape[0], nf = out_shape[1];
+        out_shape[0] = 1;
+        out_shape[1] = nf;
+        out_shape[2] = nb;
+        dims[0] = HAL_DIM_NAME_BATCH;
         dims[1] = HAL_DIM_NAME_NUM_FEATURES;
+        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+        ndim    = 3;
       }
+    }
+
+    /* Store HAL-convention shape for tensor creation in chain function */
+    if (i < 16) {
+      self->hal_ndims[i] = ndim;
+      for (size_t j = 0; j < ndim && j < 8; j++)
+        self->hal_shapes[i][j] = out_shape[j];
     }
 
     gint idx = hal_decoder_params_add_output (params, type,
         HAL_DECODER_TYPE_ULTRALYTICS, out_shape, dims, ndim);
 
+    /* Mark boxes/detection outputs as normalized.
+     * When normalized=auto (default), YOLOv8 Ultralytics outputs are assumed
+     * normalized [0,1]. Override with normalized=true|false property, or
+     * use model-config (edgefirst.json) which carries the flag explicitly. */
+    if (idx >= 0 && (type == HAL_OUTPUT_TYPE_BOXES || type == HAL_OUTPUT_TYPE_DETECTION)) {
+      gboolean is_norm = (self->normalized_prop != OVERLAY_NORMALIZED_FALSE);
+      hal_decoder_params_output_set_normalized (params, idx, is_norm ? 1 : 0);
+    }
+
     if (dtype != HAL_DTYPE_F32 && idx >= 0) {
       hal_decoder_params_output_set_quantization (params, idx, 1.0f, 0);
+    }
+
+    {
+      gchar shape_str[128];
+      gint pos = g_snprintf (shape_str, sizeof (shape_str), "[%zu", out_shape[0]);
+      for (size_t j = 1; j < ndim && pos < (gint) sizeof (shape_str) - 8; j++)
+        pos += g_snprintf (shape_str + pos, sizeof (shape_str) - pos, ",%zu", out_shape[j]);
+      g_strlcat (shape_str, "]", sizeof (shape_str));
+      GST_INFO_OBJECT (self, "  [%d] %-11s ndim=%zu dtype=%d shape=%s",
+          i, (type <= HAL_OUTPUT_TYPE_PROTOS) ? type_names[type] : "?",
+          ndim, dtype, shape_str);
     }
   }
 
@@ -805,10 +904,13 @@ overlay_auto_config_decoder (EdgefirstOverlay *self, GstCaps *caps)
     return TRUE;  /* not fatal */
   }
 
-  self->normalized = hal_decoder_normalized_boxes (self->decoder);
+  if (self->normalized_prop == OVERLAY_NORMALIZED_AUTO)
+    self->normalized = hal_decoder_normalized_boxes (self->decoder);
+  else
+    self->normalized = (self->normalized_prop == OVERLAY_NORMALIZED_TRUE);
   GST_INFO_OBJECT (self, "auto-configured decoder from tensor caps "
-      "(%d tensors, has_split=%d, has_protos=%d)",
-      num_tensors, has_split_boxes, has_protos);
+      "(%d tensors, has_split=%d, has_protos=%d, normalized=%d)",
+      num_tensors, has_split_boxes, has_protos, self->normalized);
   return TRUE;
 }
 
@@ -1333,16 +1435,18 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   for (guint i = 0; i < n_mem; i++) {
     GstMemory *mem = gst_buffer_peek_memory (buf, i);
 
-    /* Use cached shape from CAPS event if available; otherwise use flat 1D shape */
+    /* Use HAL-convention shapes from auto-config if available.
+     * These match the shapes registered with the decoder, so
+     * find_outputs_with_shape will match correctly. */
     size_t  ndim;
     size_t  shape[8];
     enum hal_dtype dtype = HAL_DTYPE_F32;
 
-    if (i < (guint) self->tensor_count && self->tensor_ndims[i] > 0) {
-      ndim  = self->tensor_ndims[i];
+    if (i < (guint) self->tensor_count && self->hal_ndims[i] > 0) {
+      ndim  = self->hal_ndims[i];
       dtype = self->tensor_dtypes[i];
       for (size_t j = 0; j < ndim; j++)
-        shape[j] = self->tensor_shapes[i][j];
+        shape[j] = self->hal_shapes[i][j];
     } else {
       size_t byte_size = gst_memory_get_sizes (mem, NULL, NULL);
       shape[0] = byte_size;
