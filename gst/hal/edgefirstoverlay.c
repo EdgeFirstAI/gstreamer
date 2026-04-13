@@ -235,11 +235,13 @@ static GstStaticPadTemplate tensors_sink_template =
         GST_PAD_SINK, GST_PAD_ALWAYS,
         GST_STATIC_CAPS ("other/tensors"));
 
+/* Output is always plain video/x-raw RGBA. DMA-BUF backing is transparent —
+ * downstream elements (e.g. waylandsink) discover DMA-BUF at buffer-import
+ * time via gst_is_dmabuf_memory(), not through caps features. */
 static GstStaticPadTemplate src_template =
     GST_STATIC_PAD_TEMPLATE ("src",
         GST_PAD_SRC, GST_PAD_ALWAYS,
         GST_STATIC_CAPS (
-            "video/x-raw(memory:DMABuf), format=RGBA, width=[1,MAX], height=[1,MAX]; "
             "video/x-raw, format=RGBA, width=[1,MAX], height=[1,MAX]"));
 
 /* ── Type definition ─────────────────────────────────────────────── */
@@ -1201,23 +1203,19 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
       self->display_w, self->display_h,
       self->display_is_dmabuf ? "yes" : "no");
 
-  /* Forward RGBA caps downstream */
-  GstCaps *out_caps;
-  if (self->display_is_dmabuf) {
-    out_caps = gst_caps_new_simple ("video/x-raw",
-        "format", G_TYPE_STRING, "RGBA",
-        "width",  G_TYPE_INT,    (gint) self->display_w,
-        "height", G_TYPE_INT,    (gint) self->display_h,
-        NULL);
-    gst_caps_set_features (out_caps, 0,
-        gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
-  } else {
-    out_caps = gst_caps_new_simple ("video/x-raw",
-        "format", G_TYPE_STRING, "RGBA",
-        "width",  G_TYPE_INT,    (gint) self->display_w,
-        "height", G_TYPE_INT,    (gint) self->display_h,
-        NULL);
-  }
+  /* Forward plain video/x-raw RGBA caps downstream with framerate from input.
+   * Do NOT advertise memory:DMABuf in caps — DMA-BUF backing is transparent.
+   * waylandsink (and other sinks) discover DMA-BUF at buffer-import time via
+   * gst_is_dmabuf_memory(), not through caps negotiation. This matches the
+   * pattern used by the working yolov8n_seg_ara2 appsrc → waylandsink path. */
+  GstCaps *out_caps = gst_caps_new_simple ("video/x-raw",
+      "format",    G_TYPE_STRING, "RGBA",
+      "width",     G_TYPE_INT,    (gint) self->display_w,
+      "height",    G_TYPE_INT,    (gint) self->display_h,
+      "framerate", GST_TYPE_FRACTION,
+                   GST_VIDEO_INFO_FPS_N (&info),
+                   GST_VIDEO_INFO_FPS_D (&info),
+      NULL);
 
   GstEvent *caps_event = gst_event_new_caps (out_caps);
   gst_caps_unref (out_caps);
@@ -1430,6 +1428,11 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
       hal_tensor_map_unmap (tmap);
     }
   }
+
+  /* Attach GstVideoMeta so downstream elements (especially waylandsink)
+   * can read stride/offset for DMA-BUF import without relying on caps. */
+  gst_buffer_add_video_meta (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
+      GST_VIDEO_FORMAT_RGBA, w, h);
 
   GST_BUFFER_PTS (outbuf)      = GST_BUFFER_PTS (buf);
   GST_BUFFER_DURATION (outbuf) = GST_BUFFER_DURATION (buf);
