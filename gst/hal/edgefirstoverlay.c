@@ -732,25 +732,52 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
     self->tensor_ndims[i] = parse_nnstreamer_dims (dim_parts[i],
         self->tensor_shapes[i], MAX_NDIM);
     self->tensor_dtypes[i] = nnstreamer_type_to_hal (type_parts[i]);
+  }
 
-    if (self->tensor_ndims[i] == 3) {
+  /* Detect protos: a 3D tensor where the first two dims are spatial (both > 1)
+   * and the third is channels, e.g. [160, 160, 32]. Distinguish from detection
+   * tensors like [1, 8400, 4] where dim[0]=1 (batch). */
+  for (gint i = 0; i < self->tensor_count; i++) {
+    size_t nd = self->tensor_ndims[i];
+    if (nd == 3 && self->tensor_shapes[i][0] > 1 && self->tensor_shapes[i][1] > 1) {
       has_protos = TRUE;
       proto_channels = self->tensor_shapes[i][2];
-    } else if (self->tensor_ndims[i] >= 2) {
-      if (self->tensor_shapes[i][1] == 4)
-        has_split_boxes = TRUE;
+      break;
+    }
+  }
+
+  /* Detect split-box format: look for a tensor with feat_dim == 4
+   * (box coordinates) that is NOT the protos tensor.
+   * After parse_nnstreamer_dims reversal, shapes are row-major [feat, boxes]
+   * for 2D or [batch, feat, boxes] for 3D. feat_dim is shapes[0] for 2D
+   * or shapes[1] for 3D (when batch=1). */
+  for (gint i = 0; i < self->tensor_count; i++) {
+    size_t nd = self->tensor_ndims[i];
+    if (nd < 2) continue;
+    /* Skip the protos tensor */
+    if (nd == 3 && self->tensor_shapes[i][0] > 1 && self->tensor_shapes[i][1] > 1)
+      continue;
+    /* Feature dim: first non-batch dimension */
+    size_t feat_dim = (nd >= 3 && self->tensor_shapes[i][0] == 1)
+        ? self->tensor_shapes[i][1] : self->tensor_shapes[i][0];
+    if (feat_dim == 4) {
+      has_split_boxes = TRUE;
+      break;
     }
   }
 
   /* ── Pass 2: compute HAL-convention shapes and output types ──── */
   /* Track per-tensor output type for quant application later */
 
-  static const char *type_names[] = {
+  static const char *type_names[HAL_OUTPUT_TYPE_CLASSES + 1] = {
     [HAL_OUTPUT_TYPE_DETECTION]         = "DETECTION",
     [HAL_OUTPUT_TYPE_BOXES]             = "BOXES",
     [HAL_OUTPUT_TYPE_SCORES]            = "SCORES",
-    [HAL_OUTPUT_TYPE_MASK_COEFFICIENTS] = "MASK_COEFF",
     [HAL_OUTPUT_TYPE_PROTOS]            = "PROTOS",
+    [HAL_OUTPUT_TYPE_SEGMENTATION]      = "SEGMENTATION",
+    [HAL_OUTPUT_TYPE_MASK_COEFFICIENTS] = "MASK_COEFF",
+    [HAL_OUTPUT_TYPE_MASK]              = "MASK",
+    [HAL_OUTPUT_TYPE_CLASSES]           = "CLASSES",
   };
 
   for (gint i = 0; i < self->tensor_count; i++) {
@@ -760,32 +787,44 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
 
     enum HalOutputType type;
 
-    if (ndim == 3) {
-      /* Protos: squeezed [H, W, C] → HAL [1, C, H, W] (4D) */
+    /* Protos: 3D with spatial dims > 1, e.g. [160, 160, 32] → HAL [1, C, H, W] */
+    gboolean is_protos = (ndim == 3 && out_shape[0] > 1 && out_shape[1] > 1);
+
+    if (is_protos) {
       size_t H = out_shape[0], W = out_shape[1], C = out_shape[2];
       out_shape[0] = 1; out_shape[1] = C; out_shape[2] = H; out_shape[3] = W;
       type = HAL_OUTPUT_TYPE_PROTOS;
       ndim = 4;
-    } else if (has_split_boxes && ndim == 2) {
-      size_t nb = out_shape[0], nf = out_shape[1];
+    } else if (has_split_boxes) {
+      /* Split-box output: classify by the feature dimension.
+       * After NNStreamer reversal, 2D shapes are [feat, boxes] and
+       * 3D shapes are [batch=1, feat, boxes]. feat is the first
+       * non-batch dimension. */
+      size_t nf, nb;
+      if (ndim >= 3 && out_shape[0] == 1) {
+        nf = out_shape[1];
+        nb = out_shape[2];
+      } else {
+        nf = out_shape[0];
+        nb = out_shape[1];
+      }
+
+      /* Normalize to HAL [1, features, boxes] */
       out_shape[0] = 1; out_shape[1] = nf; out_shape[2] = nb;
       ndim = 3;
-      if (nf == 4) type = HAL_OUTPUT_TYPE_BOXES;
+
+      if (nf == 4)
+        type = HAL_OUTPUT_TYPE_BOXES;
       else if (has_protos && proto_channels > 0 && nf == proto_channels)
         type = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
-      else type = HAL_OUTPUT_TYPE_SCORES;
-    } else if (has_split_boxes && ndim >= 3) {
-      size_t nf = out_shape[1];
-      ndim = 3;
-      if (nf == 4) type = HAL_OUTPUT_TYPE_BOXES;
-      else if (has_protos && proto_channels > 0 && nf == proto_channels)
-        type = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
-      else type = HAL_OUTPUT_TYPE_SCORES;
+      else
+        type = HAL_OUTPUT_TYPE_SCORES;
     } else {
-      /* Fused detection — always 3D [1, features, boxes] */
+      /* Fused detection — always 3D [1, features, boxes].
+       * NNStreamer reversed 2D: [feat, boxes]. */
       type = HAL_OUTPUT_TYPE_DETECTION;
-      if (ndim < 3) {
-        size_t nb = out_shape[0], nf = out_shape[1];
+      if (ndim == 2) {
+        size_t nf = out_shape[0], nb = out_shape[1];
         out_shape[0] = 1; out_shape[1] = nf; out_shape[2] = nb;
       }
       ndim = 3;
@@ -802,7 +841,7 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
       pos += g_snprintf (shape_str + pos, sizeof (shape_str) - pos, ",%zu", out_shape[j]);
     g_strlcat (shape_str, "]", sizeof (shape_str));
     GST_INFO_OBJECT (self, "  [%d] %-11s ndim=%zu dtype=%d shape=%s",
-        i, (type <= HAL_OUTPUT_TYPE_PROTOS) ? type_names[type] : "?",
+        i, (type <= HAL_OUTPUT_TYPE_CLASSES && type_names[type]) ? type_names[type] : "?",
         ndim, self->tensor_dtypes[i], shape_str);
   }
 
