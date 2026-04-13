@@ -1384,10 +1384,13 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   hal_segmentation_list  *segs_hal  = edgefirst_segmentation_list_get_hal (segs_snap);
 
   if ((boxes_hal || segs_hal) && hal_image_processor_draw_decoded_masks != NULL) {
+    guint64 t0_draw = _get_time_ns ();
     hal_image_processor_draw_decoded_masks (self->processor, self->display_image,
         boxes_hal, segs_hal, NULL, self->opacity,
         self->has_letterbox ? self->letterbox : NULL,
         (enum hal_color_mode) self->color_mode);
+    guint64 t1_draw = _get_time_ns ();
+    GST_INFO_OBJECT (self, "draw_decoded_masks: %.1f ms", (t1_draw - t0_draw) / 1e6);
   } else if (boxes_hal || segs_hal) {
     static gboolean warned_no_draw = FALSE;
     if (G_UNLIKELY (!warned_no_draw)) {
@@ -1547,6 +1550,7 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   hal_detect_box_list *new_boxes = NULL;
   struct hal_proto_data *proto   = NULL;
 
+  guint64 t0_decode = _get_time_ns ();
   if (hal_decoder_decode_proto != NULL) {
     /* HAL 0.15.0+: decode + proto in one call (supports segmentation masks) */
     proto = hal_decoder_decode_proto (self->decoder,
@@ -1556,6 +1560,7 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
     hal_decoder_decode (self->decoder,
         (const struct hal_tensor *const *) outputs, n_mem, &new_boxes, NULL);
   }
+  guint64 t1_decode = _get_time_ns ();
 
   for (guint i = 0; i < n_mem; i++) hal_tensor_free (outputs[i]);
   g_free (outputs);
@@ -1563,16 +1568,21 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   if (!new_boxes) {
     if (proto && hal_proto_data_free != NULL) hal_proto_data_free (proto);
     gst_buffer_unref (buf);
-    if (errno != 0) {
-      GST_WARNING_OBJECT (self, "hal decoder failed: %s", strerror (errno));
-      return GST_FLOW_ERROR;
-    }
+    GST_INFO_OBJECT (self, "decode: %.1f ms (0 boxes, errno=%d)",
+        (t1_decode - t0_decode) / 1e6, errno);
+    errno = 0;
     return GST_FLOW_OK;   /* zero detections this frame */
   }
+
+  guint n_boxes = (guint) hal_detect_box_list_len (new_boxes);
+  GST_INFO_OBJECT (self, "decode: %.1f ms (%u boxes%s)",
+      (t1_decode - t0_decode) / 1e6, n_boxes,
+      proto ? ", has protos" : "");
 
   /* ── Materialize masks ───────────────────────────────────────────── */
   hal_segmentation_list *new_segs = NULL;
   if (proto) {
+    guint64 t0_mat = _get_time_ns ();
     if (hal_image_processor_materialize_masks != NULL) {
       new_segs = hal_image_processor_materialize_masks (self->processor,
           new_boxes, proto, self->has_letterbox ? self->letterbox : NULL);
@@ -1581,6 +1591,9 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
           "hal_image_processor_materialize_masks not available in this HAL version; "
           "segmentation masks will not be produced");
     }
+    guint64 t1_mat = _get_time_ns ();
+    GST_INFO_OBJECT (self, "materialize_masks: %.1f ms (%s)",
+        (t1_mat - t0_mat) / 1e6, new_segs ? "ok" : "none");
     if (hal_proto_data_free != NULL) hal_proto_data_free (proto);
   }
 
