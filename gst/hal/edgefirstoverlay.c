@@ -1367,59 +1367,39 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   g_clear_object (&segs_snap);
 
   /* ── Wrap display_image as output GstBuffer ───────────────────── */
-  GstBuffer *outbuf = NULL;
+  /* Always snapshot via memcpy.  A DMA-BUF fd-dup would share the backing
+   * memory of display_image: the next frame's hal_image_processor_convert
+   * would overwrite the drawn content before waylandsink finishes reading it.
+   * hal_tensor_map_create acts as the GPU→CPU sync point, ensuring the
+   * convert + draw results are visible before the copy. */
   guint w = self->display_w, h = self->display_h;
-  gboolean dmabuf_ok = FALSE;
 
-  /* HAL >= 0.16.3 pads the row stride of DMA-BUF images to 64-byte alignment
-   * for Mali Valhall (i.MX 95).  The logical width is unchanged; padding is
-   * carried by the stride only.  Always query the actual stride so the
-   * GstVideoMeta and the DMA-BUF byte-size are correct on all platforms. */
+  /* HAL >= 0.16.3 pads the row stride to 64-byte alignment for Mali Valhall.
+   * Query the actual stride; copy row-by-row if it exceeds w × 4 so the
+   * output buffer is always dense (standard GStreamer video/x-raw layout). */
   gsize row_stride = hal_tensor_row_stride (self->display_image);
 
-  if (self->display_is_dmabuf) {
-    int fd = hal_tensor_dmabuf_clone (self->display_image);
-    if (fd >= 0) {
-      outbuf = gst_buffer_new ();
-      gst_buffer_append_memory (outbuf,
-          gst_dmabuf_allocator_alloc (self->dmabuf_allocator, fd, row_stride * h));
-      dmabuf_ok = TRUE;
-    }
-  }
-
-  if (!dmabuf_ok) {
-    outbuf = gst_buffer_new_allocate (NULL, (gsize) w * h * 4, NULL);
-    struct hal_tensor_map *tmap = hal_tensor_map_create (self->display_image);
-    if (tmap) {
-      GstMapInfo map;
-      if (gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
-        const guint8 *src = (const guint8 *) hal_tensor_map_data_const (tmap);
-        if (row_stride == (gsize) w * 4) {
-          memcpy (map.data, src, (gsize) w * h * 4);
-        } else {
-          /* Strip per-row padding so the output buffer is dense (w×4 stride). */
-          for (guint y = 0; y < h; y++)
-            memcpy ((guint8 *) map.data + y * w * 4, src + y * row_stride, (gsize) w * 4);
-        }
-        gst_buffer_unmap (outbuf, &map);
+  GstBuffer *outbuf = gst_buffer_new_allocate (NULL, (gsize) w * h * 4, NULL);
+  struct hal_tensor_map *tmap = hal_tensor_map_create (self->display_image);
+  if (tmap) {
+    GstMapInfo map;
+    if (gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
+      const guint8 *src = (const guint8 *) hal_tensor_map_data_const (tmap);
+      if (row_stride == (gsize) w * 4) {
+        memcpy (map.data, src, (gsize) w * h * 4);
+      } else {
+        /* Strip per-row padding to produce a dense (w × 4) output buffer. */
+        for (guint y = 0; y < h; y++)
+          memcpy ((guint8 *) map.data + y * w * 4, src + y * row_stride, (gsize) w * 4);
       }
-      hal_tensor_map_unmap (tmap);
+      gst_buffer_unmap (outbuf, &map);
     }
+    hal_tensor_map_unmap (tmap);
   }
 
-  /* Attach GstVideoMeta so downstream elements (especially waylandsink) can
-   * read stride/offset for DMA-BUF import without relying on caps.
-   * DMA-BUF path: pass the actual (possibly padded) row stride.
-   * System-memory path: output is dense — default stride (w × 4) is correct. */
-  if (dmabuf_ok) {
-    gsize offsets[1] = {0};
-    gint  strides[1] = {(gint) row_stride};
-    gst_buffer_add_video_meta_full (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
-        GST_VIDEO_FORMAT_RGBA, w, h, 1, offsets, strides);
-  } else {
-    gst_buffer_add_video_meta (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
-        GST_VIDEO_FORMAT_RGBA, w, h);
-  }
+  /* Standard VideoMeta: output is dense so default stride (w × 4) is correct. */
+  gst_buffer_add_video_meta (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
+      GST_VIDEO_FORMAT_RGBA, w, h);
 
   GST_BUFFER_PTS (outbuf)      = GST_BUFFER_PTS (buf);
   GST_BUFFER_DURATION (outbuf) = GST_BUFFER_DURATION (buf);
