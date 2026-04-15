@@ -3,7 +3,7 @@
  * Copyright (C) 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * Dual-sink GstElement: accepts video + other/tensors, runs HAL 0.15.0
+ * Dual-sink GstElement: accepts video + other/tensors, runs HAL >= 0.16.3
  * decode->materialize->draw pipeline, emits new-detection signal.
  */
 
@@ -25,37 +25,7 @@
 #include <nnstreamer_tensor_quant_meta.h>
 #endif
 
-/* hal_image_processor_draw_decoded_masks was added in HAL 0.15.0.
- * Declare weak so the plugin still loads against older library versions;
- * the video chain guards the call with a NULL check at runtime. */
-extern int hal_image_processor_draw_decoded_masks (struct hal_image_processor *processor,
-    struct hal_tensor *dst,
-    const struct hal_detect_box_list *detections,
-    const struct hal_segmentation_list *segmentations,
-    const struct hal_tensor *background,
-    float opacity,
-    const float *letterbox,
-    enum hal_color_mode color_mode) __attribute__((weak));
-
-/* hal_image_processor_materialize_masks was added in HAL 0.15.0.
- * Declare weak so the plugin still loads against older library versions;
- * the tensor chain guards the call with a NULL check at runtime. */
-extern struct hal_segmentation_list *hal_image_processor_materialize_masks (
-    struct hal_image_processor *processor,
-    const struct hal_detect_box_list *detections,
-    const struct hal_proto_data *proto,
-    const float *letterbox) __attribute__((weak));
-
-/* hal_decoder_decode_proto and hal_proto_data_free were added in HAL 0.15.0.
- * Declare weak so the plugin still loads against older library versions;
- * the tensor chain falls back to hal_decoder_decode when NULL at runtime. */
-extern struct hal_proto_data *hal_decoder_decode_proto (
-    const struct hal_decoder *decoder,
-    const struct hal_tensor *const *outputs,
-    size_t num_outputs,
-    struct hal_detect_box_list **out_boxes) __attribute__((weak));
-
-extern void hal_proto_data_free (struct hal_proto_data *proto) __attribute__((weak));
+/* HAL >= 0.16.3 is a hard dependency — all APIs below are always available. */
 
 GST_DEBUG_CATEGORY_STATIC (edgefirst_overlay_debug);
 #define GST_CAT_DEFAULT edgefirst_overlay_debug
@@ -1383,7 +1353,7 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   hal_detect_box_list    *boxes_hal = edgefirst_detect_box_list_get_hal (boxes_snap);
   hal_segmentation_list  *segs_hal  = edgefirst_segmentation_list_get_hal (segs_snap);
 
-  if ((boxes_hal || segs_hal) && hal_image_processor_draw_decoded_masks != NULL) {
+  if (boxes_hal || segs_hal) {
     guint64 t0_draw = _get_time_ns ();
     hal_image_processor_draw_decoded_masks (self->processor, self->display_image,
         boxes_hal, segs_hal, NULL, self->opacity,
@@ -1391,14 +1361,6 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
         (enum hal_color_mode) self->color_mode);
     guint64 t1_draw = _get_time_ns ();
     GST_INFO_OBJECT (self, "draw_decoded_masks: %.1f ms", (t1_draw - t0_draw) / 1e6);
-  } else if (boxes_hal || segs_hal) {
-    static gboolean warned_no_draw = FALSE;
-    if (G_UNLIKELY (!warned_no_draw)) {
-      warned_no_draw = TRUE;
-      GST_WARNING_OBJECT (self,
-          "hal_image_processor_draw_decoded_masks not available in this HAL version; "
-          "overlay drawing disabled (upgrade to HAL >= 0.15.0)");
-    }
   }
 
   g_clear_object (&boxes_snap);
@@ -1409,12 +1371,18 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   guint w = self->display_w, h = self->display_h;
   gboolean dmabuf_ok = FALSE;
 
+  /* HAL >= 0.16.3 pads the row stride of DMA-BUF images to 64-byte alignment
+   * for Mali Valhall (i.MX 95).  The logical width is unchanged; padding is
+   * carried by the stride only.  Always query the actual stride so the
+   * GstVideoMeta and the DMA-BUF byte-size are correct on all platforms. */
+  gsize row_stride = hal_tensor_row_stride (self->display_image);
+
   if (self->display_is_dmabuf) {
     int fd = hal_tensor_dmabuf_clone (self->display_image);
     if (fd >= 0) {
       outbuf = gst_buffer_new ();
       gst_buffer_append_memory (outbuf,
-          gst_dmabuf_allocator_alloc (self->dmabuf_allocator, fd, (gsize) w * h * 4));
+          gst_dmabuf_allocator_alloc (self->dmabuf_allocator, fd, row_stride * h));
       dmabuf_ok = TRUE;
     }
   }
@@ -1425,17 +1393,33 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
     if (tmap) {
       GstMapInfo map;
       if (gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
-        memcpy (map.data, hal_tensor_map_data_const (tmap), (gsize) w * h * 4);
+        const guint8 *src = (const guint8 *) hal_tensor_map_data_const (tmap);
+        if (row_stride == (gsize) w * 4) {
+          memcpy (map.data, src, (gsize) w * h * 4);
+        } else {
+          /* Strip per-row padding so the output buffer is dense (w×4 stride). */
+          for (guint y = 0; y < h; y++)
+            memcpy ((guint8 *) map.data + y * w * 4, src + y * row_stride, (gsize) w * 4);
+        }
         gst_buffer_unmap (outbuf, &map);
       }
       hal_tensor_map_unmap (tmap);
     }
   }
 
-  /* Attach GstVideoMeta so downstream elements (especially waylandsink)
-   * can read stride/offset for DMA-BUF import without relying on caps. */
-  gst_buffer_add_video_meta (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
-      GST_VIDEO_FORMAT_RGBA, w, h);
+  /* Attach GstVideoMeta so downstream elements (especially waylandsink) can
+   * read stride/offset for DMA-BUF import without relying on caps.
+   * DMA-BUF path: pass the actual (possibly padded) row stride.
+   * System-memory path: output is dense — default stride (w × 4) is correct. */
+  if (dmabuf_ok) {
+    gsize offsets[1] = {0};
+    gint  strides[1] = {(gint) row_stride};
+    gst_buffer_add_video_meta_full (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
+        GST_VIDEO_FORMAT_RGBA, w, h, 1, offsets, strides);
+  } else {
+    gst_buffer_add_video_meta (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
+        GST_VIDEO_FORMAT_RGBA, w, h);
+  }
 
   GST_BUFFER_PTS (outbuf)      = GST_BUFFER_PTS (buf);
   GST_BUFFER_DURATION (outbuf) = GST_BUFFER_DURATION (buf);
@@ -1551,22 +1535,15 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   struct hal_proto_data *proto   = NULL;
 
   guint64 t0_decode = _get_time_ns ();
-  if (hal_decoder_decode_proto != NULL) {
-    /* HAL 0.15.0+: decode + proto in one call (supports segmentation masks) */
-    proto = hal_decoder_decode_proto (self->decoder,
-        (const struct hal_tensor *const *) outputs, n_mem, &new_boxes);
-  } else {
-    /* HAL < 0.15.0: decode without proto (detection only, no segmentation masks) */
-    hal_decoder_decode (self->decoder,
-        (const struct hal_tensor *const *) outputs, n_mem, &new_boxes, NULL);
-  }
+  proto = hal_decoder_decode_proto (self->decoder,
+      (const struct hal_tensor *const *) outputs, n_mem, &new_boxes);
   guint64 t1_decode = _get_time_ns ();
 
   for (guint i = 0; i < n_mem; i++) hal_tensor_free (outputs[i]);
   g_free (outputs);
 
   if (!new_boxes) {
-    if (proto && hal_proto_data_free != NULL) hal_proto_data_free (proto);
+    if (proto) hal_proto_data_free (proto);
     gst_buffer_unref (buf);
     GST_INFO_OBJECT (self, "decode: %.1f ms (0 boxes, errno=%d)",
         (t1_decode - t0_decode) / 1e6, errno);
@@ -1583,18 +1560,12 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   hal_segmentation_list *new_segs = NULL;
   if (proto) {
     guint64 t0_mat = _get_time_ns ();
-    if (hal_image_processor_materialize_masks != NULL) {
-      new_segs = hal_image_processor_materialize_masks (self->processor,
-          new_boxes, proto, self->has_letterbox ? self->letterbox : NULL);
-    } else {
-      GST_WARNING_OBJECT (self,
-          "hal_image_processor_materialize_masks not available in this HAL version; "
-          "segmentation masks will not be produced");
-    }
+    new_segs = hal_image_processor_materialize_masks (self->processor,
+        new_boxes, proto, self->has_letterbox ? self->letterbox : NULL);
     guint64 t1_mat = _get_time_ns ();
     GST_INFO_OBJECT (self, "materialize_masks: %.1f ms (%s)",
         (t1_mat - t0_mat) / 1e6, new_segs ? "ok" : "none");
-    if (hal_proto_data_free != NULL) hal_proto_data_free (proto);
+    hal_proto_data_free (proto);
   }
 
   /* ── Wrap in GObjects ────────────────────────────────────────────── */
