@@ -723,18 +723,17 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
 
   /* Detect split-box format: look for a tensor with feat_dim == 4
    * (box coordinates) that is NOT the protos tensor.
-   * After parse_nnstreamer_dims reversal, shapes are row-major [feat, boxes]
-   * for 2D or [batch, feat, boxes] for 3D. feat_dim is shapes[0] for 2D
-   * or shapes[1] for 3D (when batch=1). */
+   * After parse_nnstreamer_dims reversal, NNStr "anchors-first" format
+   * ("4:8400:1") gives shapes [anchors, features] — features are LAST. */
   for (gint i = 0; i < self->tensor_count; i++) {
     size_t nd = self->tensor_ndims[i];
     if (nd < 2) continue;
     /* Skip the protos tensor */
     if (nd == 3 && self->tensor_shapes[i][0] > 1 && self->tensor_shapes[i][1] > 1)
       continue;
-    /* Feature dim: first non-batch dimension */
-    size_t feat_dim = (nd >= 3 && self->tensor_shapes[i][0] == 1)
-        ? self->tensor_shapes[i][1] : self->tensor_shapes[i][0];
+    /* Feature dim: LAST dimension (NNStr "anchors-first" convention stores
+     * features innermost; parse_nnstreamer_dims reversal places them last) */
+    size_t feat_dim = self->tensor_shapes[i][nd - 1];
     if (feat_dim == 4) {
       has_split_boxes = TRUE;
       break;
@@ -772,19 +771,14 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
       ndim = 4;
     } else if (has_split_boxes) {
       /* Split-box output: classify by the feature dimension.
-       * After NNStreamer reversal, 2D shapes are [feat, boxes] and
-       * 3D shapes are [batch=1, feat, boxes]. feat is the first
-       * non-batch dimension. */
-      size_t nf, nb;
-      if (ndim >= 3 && out_shape[0] == 1) {
-        nf = out_shape[1];
-        nb = out_shape[2];
-      } else {
-        nf = out_shape[0];
-        nb = out_shape[1];
-      }
+       * After NNStreamer reversal, 2D shapes are [anchors, features] and
+       * 3D shapes are [batch=1, anchors, features]. Features are in the
+       * LAST dimension (NNStr "anchors-first" / Ara-2 convention). */
+      size_t last = ndim - 1;
+      size_t nf = out_shape[last];                                            /* features (4, 80, 32 …) */
+      size_t nb = (ndim >= 3 && out_shape[0] == 1) ? out_shape[1] : out_shape[0]; /* anchors */
 
-      /* Normalize to HAL [1, features, boxes] */
+      /* Normalize to HAL [1, features, anchors] — matches add_split() in reference binary */
       out_shape[0] = 1; out_shape[1] = nf; out_shape[2] = nb;
       ndim = 3;
 
