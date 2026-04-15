@@ -136,7 +136,8 @@ struct _EdgefirstOverlay {
   /* HAL state */
   hal_image_processor   *processor;
   hal_decoder           *decoder;
-  hal_tensor            *display_image;   /* persistent RGBA render target */
+  hal_tensor            *display_images[2]; /* double-buffered RGBA render targets */
+  guint                  display_buf_idx;   /* index of buffer to render into this frame */
   gboolean               display_is_dmabuf;
   GstAllocator          *dmabuf_allocator;
 
@@ -586,8 +587,10 @@ overlay_stop (EdgefirstOverlay *self)
   hal_image_processor_free (self->processor);
   self->processor = NULL;
 
-  hal_tensor_free (self->display_image);
-  self->display_image = NULL;
+  for (int i = 0; i < 2; i++) {
+    hal_tensor_free (self->display_images[i]);
+    self->display_images[i] = NULL;
+  }
 
   g_mutex_lock (&self->lock);
   g_clear_object (&self->boxes_obj);
@@ -1145,23 +1148,28 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
     g_free (colors);
   }
 
-  hal_tensor_free (self->display_image);
-  guint64 t0_display = _get_time_ns ();
-  self->display_image = hal_image_processor_create_image (self->processor,
-      (size_t) self->display_w, (size_t) self->display_h,
-      HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
-  guint64 t1_display = _get_time_ns ();
-  GST_INFO_OBJECT (self, "hal_image_processor_create_image (display %ux%u RGBA) "
-      "took %.1f ms", self->display_w, self->display_h,
-      (t1_display - t0_display) / 1e6);
-  if (!self->display_image) {
-    GST_ERROR_OBJECT (self, "Failed to allocate display image (%ux%u)",
-        self->display_w, self->display_h);
-    return FALSE;
+  /* Allocate two display images for double-buffering.  The DMA-BUF clone path
+   * shares physical memory with display_image — double-buffering lets frame N's
+   * fd remain valid while frame N+1 is rendered into the other buffer. */
+  for (int i = 0; i < 2; i++) {
+    hal_tensor_free (self->display_images[i]);
+    guint64 t0 = _get_time_ns ();
+    self->display_images[i] = hal_image_processor_create_image (self->processor,
+        (size_t) self->display_w, (size_t) self->display_h,
+        HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    guint64 t1 = _get_time_ns ();
+    GST_INFO_OBJECT (self, "create_image buf[%d] %ux%u RGBA: %.1f ms",
+        i, self->display_w, self->display_h, (t1 - t0) / 1e6);
+    if (!self->display_images[i]) {
+      GST_ERROR_OBJECT (self, "Failed to allocate display image[%d] (%ux%u)",
+          i, self->display_w, self->display_h);
+      return FALSE;
+    }
   }
+  self->display_buf_idx = 0;
 
-  /* Check DMABuf availability */
-  int test_fd = hal_tensor_dmabuf_clone (self->display_image);
+  /* Probe DMA-BUF availability once; both images were allocated identically. */
+  int test_fd = hal_tensor_dmabuf_clone (self->display_images[0]);
   if (test_fd >= 0) {
     close (test_fd);
     self->display_is_dmabuf = TRUE;
@@ -1169,7 +1177,7 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
     self->display_is_dmabuf = FALSE;
   }
 
-  GST_INFO_OBJECT (self, "display image %ux%u RGBA, dmabuf=%s",
+  GST_INFO_OBJECT (self, "display image %ux%u RGBA, dmabuf=%s (double-buffered)",
       self->display_w, self->display_h,
       self->display_is_dmabuf ? "yes" : "no");
 
@@ -1325,6 +1333,9 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   }
 
   /* ── Convert input to RGBA display_image ─────────────────────── */
+  /* Pick the current back buffer; front buffer (previous frame) is in flight. */
+  hal_tensor *display_image = self->display_images[self->display_buf_idx];
+
   hal_tensor *src_img = create_input_image (self, buf);
   if (!src_img) {
     g_clear_object (&boxes_snap);
@@ -1335,7 +1346,7 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
 
   guint64 t0_convert = _get_time_ns ();
   int convert_ret = hal_image_processor_convert (self->processor, src_img,
-      self->display_image, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
+      display_image, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
   guint64 t1_convert = _get_time_ns ();
   GST_INFO_OBJECT (self, "hal_image_processor_convert took %.1f ms",
       (t1_convert - t0_convert) / 1e6);
@@ -1355,7 +1366,7 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
 
   if (boxes_hal || segs_hal) {
     guint64 t0_draw = _get_time_ns ();
-    hal_image_processor_draw_decoded_masks (self->processor, self->display_image,
+    hal_image_processor_draw_decoded_masks (self->processor, display_image,
         boxes_hal, segs_hal, NULL, self->opacity,
         self->has_letterbox ? self->letterbox : NULL,
         (enum hal_color_mode) self->color_mode);
@@ -1367,39 +1378,62 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   g_clear_object (&segs_snap);
 
   /* ── Wrap display_image as output GstBuffer ───────────────────── */
-  /* Always snapshot via memcpy.  A DMA-BUF fd-dup would share the backing
-   * memory of display_image: the next frame's hal_image_processor_convert
-   * would overwrite the drawn content before waylandsink finishes reading it.
-   * hal_tensor_map_create acts as the GPU→CPU sync point, ensuring the
-   * convert + draw results are visible before the copy. */
+  GstBuffer *outbuf = NULL;
   guint w = self->display_w, h = self->display_h;
+  gboolean dmabuf_ok = FALSE;
 
-  /* HAL >= 0.16.3 pads the row stride to 64-byte alignment for Mali Valhall.
-   * Query the actual stride; copy row-by-row if it exceeds w × 4 so the
-   * output buffer is always dense (standard GStreamer video/x-raw layout). */
-  gsize row_stride = hal_tensor_row_stride (self->display_image);
+  /* HAL >= 0.16.3 pads the row stride to 64-byte alignment on Mali Valhall;
+   * query the actual stride for correct DMA-BUF size and GstVideoMeta. */
+  gsize row_stride = hal_tensor_row_stride (display_image);
 
-  GstBuffer *outbuf = gst_buffer_new_allocate (NULL, (gsize) w * h * 4, NULL);
-  struct hal_tensor_map *tmap = hal_tensor_map_create (self->display_image);
-  if (tmap) {
-    GstMapInfo map;
-    if (gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
-      const guint8 *src = (const guint8 *) hal_tensor_map_data_const (tmap);
-      if (row_stride == (gsize) w * 4) {
-        memcpy (map.data, src, (gsize) w * h * 4);
-      } else {
-        /* Strip per-row padding to produce a dense (w × 4) output buffer. */
-        for (guint y = 0; y < h; y++)
-          memcpy ((guint8 *) map.data + y * w * 4, src + y * row_stride, (gsize) w * 4);
-      }
-      gst_buffer_unmap (outbuf, &map);
+  if (self->display_is_dmabuf) {
+    int fd = hal_tensor_dmabuf_clone (display_image);
+    if (fd >= 0) {
+      outbuf = gst_buffer_new ();
+      gst_buffer_append_memory (outbuf,
+          gst_dmabuf_allocator_alloc (self->dmabuf_allocator, fd, row_stride * h));
+      /* Advance to the other buffer so the next frame renders there while
+       * downstream (waylandsink) holds the current frame's DMA-BUF fd. */
+      self->display_buf_idx = (self->display_buf_idx + 1) % 2;
+      dmabuf_ok = TRUE;
     }
-    hal_tensor_map_unmap (tmap);
   }
 
-  /* Standard VideoMeta: output is dense so default stride (w × 4) is correct. */
-  gst_buffer_add_video_meta (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
-      GST_VIDEO_FORMAT_RGBA, w, h);
+  if (!dmabuf_ok) {
+    /* System-memory fallback: memcpy snapshot is safe with a single buffer
+     * because the copy completes before the buffer is pushed downstream. */
+    outbuf = gst_buffer_new_allocate (NULL, (gsize) w * h * 4, NULL);
+    struct hal_tensor_map *tmap = hal_tensor_map_create (display_image);
+    if (tmap) {
+      GstMapInfo map;
+      if (gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
+        const guint8 *src = (const guint8 *) hal_tensor_map_data_const (tmap);
+        if (row_stride == (gsize) w * 4) {
+          memcpy (map.data, src, (gsize) w * h * 4);
+        } else {
+          /* Strip per-row padding to produce a dense (w × 4) output buffer. */
+          for (guint y = 0; y < h; y++)
+            memcpy ((guint8 *) map.data + y * w * 4, src + y * row_stride, (gsize) w * 4);
+        }
+        gst_buffer_unmap (outbuf, &map);
+      }
+      hal_tensor_map_unmap (tmap);
+    }
+  }
+
+  /* Attach GstVideoMeta so downstream elements (especially waylandsink) can
+   * read stride/offset for DMA-BUF import without relying on caps.
+   * DMA-BUF path: pass the actual (possibly padded) row stride.
+   * System-memory path: output is dense — default stride (w × 4) is correct. */
+  if (dmabuf_ok) {
+    gsize offsets[1] = {0};
+    gint  strides[1] = {(gint) row_stride};
+    gst_buffer_add_video_meta_full (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
+        GST_VIDEO_FORMAT_RGBA, w, h, 1, offsets, strides);
+  } else {
+    gst_buffer_add_video_meta (outbuf, GST_VIDEO_FRAME_FLAG_NONE,
+        GST_VIDEO_FORMAT_RGBA, w, h);
+  }
 
   GST_BUFFER_PTS (outbuf)      = GST_BUFFER_PTS (buf);
   GST_BUFFER_DURATION (outbuf) = GST_BUFFER_DURATION (buf);
