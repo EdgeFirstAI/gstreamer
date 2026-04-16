@@ -165,6 +165,11 @@ struct _EdgefirstOverlay {
   size_t   hal_ndims[16];
   size_t   hal_shapes[16][8];
   enum HalOutputType tensor_types[16];
+  /* For protos tensors, remember the physical memory layout so
+   * overlay_create_decoder can label the axes correctly. HAL's
+   * swap_axes_if_needed then reorders to canonical NHWC without
+   * touching the byte stream. */
+  gboolean tensor_protos_is_nhwc[16];
   gint     tensor_count;
   enum hal_dtype tensor_dtypes[16];
   gboolean caps_parsed;           /* TRUE after tensors CAPS event parsed */
@@ -183,6 +188,7 @@ struct _EdgefirstOverlay {
   gchar     *letterbox_str;
   gboolean   has_letterbox;
   gfloat     letterbox[4];
+  gfloat     auto_letterbox[4]; /* scratch buffer for overlay_effective_letterbox */
   gfloat     opacity;
   EdgeFirstColorMode color_mode;
   gchar     *class_colors;
@@ -501,6 +507,42 @@ parse_decoder_version (const gchar *str)
   return HAL_DECODER_VERSION_YOLOV8;
 }
 
+/* Return the letterbox rect to pass to HAL mask operations.
+ *
+ * If the user configured the `letterbox` property explicitly, honour it.
+ * Otherwise auto-compute an aspect-preserving fit of the incoming video
+ * into the model input dimensions — matching what `edgefirstcameraadaptor
+ * letterbox=true` produces upstream, so masks land on the real image area
+ * instead of being stretched across the whole canvas.
+ *
+ * Returns NULL when the letterbox cannot yet be determined (video caps or
+ * model dimensions unknown); HAL treats NULL as "no correction". */
+static const gfloat *
+overlay_effective_letterbox (EdgefirstOverlay *self)
+{
+  if (self->has_letterbox)
+    return self->letterbox;
+
+  guint mw = self->model_width;
+  guint mh = self->model_height > 0 ? self->model_height : self->model_width;
+  if (self->display_w == 0 || self->display_h == 0 || mw == 0 || mh == 0)
+    return NULL;
+
+  gfloat scale_x = (gfloat) mw / (gfloat) self->display_w;
+  gfloat scale_y = (gfloat) mh / (gfloat) self->display_h;
+  gfloat scale   = scale_x < scale_y ? scale_x : scale_y;
+  gfloat fitted_w = (gfloat) self->display_w * scale;
+  gfloat fitted_h = (gfloat) self->display_h * scale;
+  gfloat pad_x = ((gfloat) mw - fitted_w) * 0.5f;
+  gfloat pad_y = ((gfloat) mh - fitted_h) * 0.5f;
+
+  self->auto_letterbox[0] = pad_x / (gfloat) mw;
+  self->auto_letterbox[1] = pad_y / (gfloat) mh;
+  self->auto_letterbox[2] = (pad_x + fitted_w) / (gfloat) mw;
+  self->auto_letterbox[3] = (pad_y + fitted_h) / (gfloat) mh;
+  return self->auto_letterbox;
+}
+
 /* Map GstVideoFormat to HAL pixel format */
 static enum hal_pixel_format
 gst_format_to_hal (GstVideoFormat fmt)
@@ -761,12 +803,28 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
 
     enum HalOutputType type;
 
-    /* Protos: 3D with spatial dims > 1, e.g. [160, 160, 32] → HAL [1, C, H, W] */
+    /* Protos: 3D with spatial dims > 1. Two memory layouts are possible
+     * depending on the framework:
+     *   - TFLite / NHWC: [H, W, C]  — channels innermost
+     *   - Ara-2  / NCHW: [C, H, W]  — channels outermost
+     * Detect by the smallest dim (C is always << H, W for YOLOv8 protos)
+     * and label the axes to match the physical memory layout. HAL's
+     * `swap_axes_if_needed` then reorders to its canonical NHWC without
+     * touching the byte stream, and `protos_to_hwc` is a no-op.
+     *
+     * Mislabeling (e.g. calling NHWC data NCHW) silently corrupts the
+     * stride computation in the fused dequant-dot-sigmoid kernel, so
+     * getting this right is load-bearing for mask rendering. */
     gboolean is_protos = (ndim == 3 && out_shape[0] > 1 && out_shape[1] > 1);
+    gboolean protos_is_nhwc = FALSE;
 
     if (is_protos) {
       size_t H = out_shape[0], W = out_shape[1], C = out_shape[2];
+      /* Always emit [1, C, H, W] with NCHW dim labels. HAL's
+       * protos_to_hwc heuristic then permutes the view to HWC
+       * when C < H (the common case for YOLOv8 protos). */
       out_shape[0] = 1; out_shape[1] = C; out_shape[2] = H; out_shape[3] = W;
+      protos_is_nhwc = FALSE;
       type = HAL_OUTPUT_TYPE_PROTOS;
       ndim = 4;
     } else if (has_split_boxes) {
@@ -803,6 +861,7 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
 
     self->hal_ndims[i] = ndim;
     self->tensor_types[i] = type;
+    self->tensor_protos_is_nhwc[i] = protos_is_nhwc;
     for (size_t j = 0; j < ndim && j < 8; j++)
       self->hal_shapes[i][j] = out_shape[j];
 
@@ -852,6 +911,13 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
       break;
     }
   }
+  /* Persist the effective model size so overlay_effective_letterbox() can
+   * use it to auto-compute a letterbox when the property is unset. YOLOv8
+   * models have square inputs, so width == height. */
+  if (self->model_width == 0)
+    self->model_width = model_input_size;
+  if (self->model_height == 0)
+    self->model_height = model_input_size;
 
   /* Extract quantization parameters from buffer if available */
 #if HAVE_NNSTREAMER
@@ -894,9 +960,13 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
     gint idx = hal_decoder_params_add_output (params, type,
         HAL_DECODER_TYPE_ULTRALYTICS, self->hal_shapes[i], dims, ndim);
 
+    gboolean is_norm = (self->normalized_prop != OVERLAY_NORMALIZED_FALSE);
     if (idx >= 0 && (type == HAL_OUTPUT_TYPE_BOXES || type == HAL_OUTPUT_TYPE_DETECTION)) {
-      gboolean is_norm = (self->normalized_prop != OVERLAY_NORMALIZED_FALSE);
-      hal_decoder_params_output_set_normalized (params, idx, is_norm ? 1 : 0);
+      /* Always tell the decoder our output is normalized: for TFLite the
+       * quant values are natively [0,1]; for pixel-space DVM exports the
+       * scale adjustment below converts them to [0,1]. Either way the
+       * decoder must not apply its own normalization on top. */
+      hal_decoder_params_output_set_normalized (params, idx, 1);
       boxes_idx = idx;
     }
 
@@ -916,13 +986,21 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
       }
 #endif
 
-      /* For boxes, scale must account for model input size to normalize
-       * pixel-space coordinates to [0,1]. See yolov8n_seg_ara2.cpp:273 */
-      if ((type == HAL_OUTPUT_TYPE_BOXES || type == HAL_OUTPUT_TYPE_DETECTION)
+      /* Box tensors come in two conventions depending on the model export:
+       *   - normalized: dequant values already in [0,1] (TFLite uint8
+       *     YOLOv8-seg, future Ara-2 DVM exports)
+       *   - pixel-space: dequant values in [0, model_input_size] (current
+       *     Ara-2 int8 DVM exports)
+       * The `normalized` property drives this — default TRUE (normalized)
+       * matches the preferred export convention. When the user declares
+       * pixel-space via `normalized=false`, divide the quant scale by the
+       * model input size so the HAL decoder still sees [0,1] coordinates. */
+      if (!is_norm
+          && (type == HAL_OUTPUT_TYPE_BOXES || type == HAL_OUTPUT_TYPE_DETECTION)
           && model_input_size > 0 && scale != 1.0f) {
         scale /= (gfloat) model_input_size;
-        GST_DEBUG_OBJECT (self, "  [%d] boxes scale adjusted by /%u → %g",
-            i, model_input_size, scale);
+        GST_DEBUG_OBJECT (self, "  [%d] boxes scale adjusted by /%u → %g "
+            "(pixel-space quant → [0,1])", i, model_input_size, scale);
       }
 
       hal_decoder_params_output_set_quantization (params, idx, scale, zp);
@@ -1388,7 +1466,7 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
     guint64 t0_draw = _get_time_ns ();
     hal_image_processor_draw_decoded_masks (self->processor, display_image,
         boxes_hal, segs_hal, NULL, self->opacity,
-        self->has_letterbox ? self->letterbox : NULL,
+        overlay_effective_letterbox (self),
         (enum hal_color_mode) self->color_mode);
     guint64 t1_draw = _get_time_ns ();
     GST_INFO_OBJECT (self, "draw_decoded_masks: %.1f ms", (t1_draw - t0_draw) / 1e6);
@@ -1595,7 +1673,7 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   if (proto) {
     guint64 t0_mat = _get_time_ns ();
     new_segs = hal_image_processor_materialize_masks (self->processor,
-        new_boxes, proto, self->has_letterbox ? self->letterbox : NULL);
+        new_boxes, proto, overlay_effective_letterbox (self));
     guint64 t1_mat = _get_time_ns ();
     GST_INFO_OBJECT (self, "materialize_masks: %.1f ms (%s)",
         (t1_mat - t0_mat) / 1e6, new_segs ? "ok" : "none");
