@@ -1012,6 +1012,19 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
       return NULL;
   }
 
+  /* Prefer GstVideoMeta for plane layout — it is the authoritative record of
+   * the actual buffer strides and offsets set by the producer (e.g.
+   * v4l2h264dec, which pads the Y plane to a macroblock boundary). The
+   * GstVideoInfo parsed from caps only carries width/height and computes
+   * *tight-packed* strides, so it silently corrupts buffers that have row
+   * or plane padding. Reading the wrong UV offset manifests as a colored
+   * band at the top of the output (UV sampled from Y-plane padding bytes). */
+  GstVideoMeta *vm = gst_buffer_get_video_meta (inbuf);
+  gint    y_stride  = vm ? vm->stride[0] : GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
+  gint    uv_stride = vm ? vm->stride[1] : GST_VIDEO_INFO_PLANE_STRIDE (info, 1);
+  gsize   y_offset  = vm ? vm->offset[0] : GST_VIDEO_INFO_PLANE_OFFSET (info, 0);
+  gsize   uv_offset = vm ? vm->offset[1] : GST_VIDEO_INFO_PLANE_OFFSET (info, 1);
+
   /* Try DMA-BUF zero-copy path */
   guint n_mem = gst_buffer_n_memory (inbuf);
   GstMemory *in_mem = gst_buffer_peek_memory (inbuf, 0);
@@ -1019,19 +1032,30 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
     int fd = gst_dmabuf_memory_get_fd (in_mem);
     struct hal_plane_descriptor *pd = hal_plane_descriptor_new (fd);
     if (pd) {
-      gint stride = GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
-      hal_plane_descriptor_set_stride (pd, (size_t) stride);
+      hal_plane_descriptor_set_stride (pd, (size_t) y_stride);
+      if (y_offset > 0)
+        hal_plane_descriptor_set_offset (pd, y_offset);
 
       struct hal_plane_descriptor *chroma = NULL;
-      if (n_mem >= 2 && pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
-        GstMemory *mem1 = gst_buffer_peek_memory (inbuf, 1);
-        if (gst_is_dmabuf_memory (mem1)) {
-          int uv_fd = gst_dmabuf_memory_get_fd (mem1);
-          chroma = hal_plane_descriptor_new (uv_fd);
-          if (chroma) {
-            gint uv_stride = GST_VIDEO_INFO_PLANE_STRIDE (info, 1);
-            hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
+      if (pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
+        int   uv_fd = fd;
+        gsize chroma_offset = uv_offset;
+        if (n_mem >= 2) {
+          /* UV in its own GstMemory block: use that fd, offset starts at 0 */
+          GstMemory *mem1 = gst_buffer_peek_memory (inbuf, 1);
+          if (gst_is_dmabuf_memory (mem1)) {
+            uv_fd = gst_dmabuf_memory_get_fd (mem1);
+            chroma_offset = 0;
           }
+        }
+        /* Always attach a chroma descriptor for NV12 so HAL uses the exact
+         * UV offset we pass rather than computing it from (Y stride × height),
+         * which is only correct for unpadded layouts. */
+        chroma = hal_plane_descriptor_new (uv_fd);
+        if (chroma) {
+          hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
+          if (chroma_offset > 0)
+            hal_plane_descriptor_set_offset (chroma, chroma_offset);
         }
       }
 
