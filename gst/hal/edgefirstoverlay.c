@@ -721,20 +721,20 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
     }
   }
 
-  /* Detect split-box format: look for a tensor with feat_dim == 4
-   * (box coordinates) that is NOT the protos tensor.
-   * After parse_nnstreamer_dims reversal, NNStr "anchors-first" format
-   * ("4:8400:1") gives shapes [anchors, features] — features are LAST. */
+  /* Detect split-box format: look for a tensor whose box-coordinate dimension == 4.
+   * Two conventions exist after parse_nnstreamer_dims reversal:
+   *   TFLite (features-first): [1,4,8400] → [4,8400]   — features at shape[0]
+   *   Ara-2  (anchors-first):  [1,8400,4] → [8400,4]   — features at shape[nd-1]
+   * Check both ends to handle either framework. */
   for (gint i = 0; i < self->tensor_count; i++) {
     size_t nd = self->tensor_ndims[i];
     if (nd < 2) continue;
     /* Skip the protos tensor */
     if (nd == 3 && self->tensor_shapes[i][0] > 1 && self->tensor_shapes[i][1] > 1)
       continue;
-    /* Feature dim: LAST dimension (NNStr "anchors-first" convention stores
-     * features innermost; parse_nnstreamer_dims reversal places them last) */
-    size_t feat_dim = self->tensor_shapes[i][nd - 1];
-    if (feat_dim == 4) {
+    size_t d0    = self->tensor_shapes[i][0];
+    size_t dlast = self->tensor_shapes[i][nd - 1];
+    if (d0 == 4 || dlast == 4) {
       has_split_boxes = TRUE;
       break;
     }
@@ -770,13 +770,15 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
       type = HAL_OUTPUT_TYPE_PROTOS;
       ndim = 4;
     } else if (has_split_boxes) {
-      /* Split-box output: classify by the feature dimension.
-       * After NNStreamer reversal, 2D shapes are [anchors, features] and
-       * 3D shapes are [batch=1, anchors, features]. Features are in the
-       * LAST dimension (NNStr "anchors-first" / Ara-2 convention). */
-      size_t last = ndim - 1;
-      size_t nf = out_shape[last];                                            /* features (4, 80, 32 …) */
-      size_t nb = (ndim >= 3 && out_shape[0] == 1) ? out_shape[1] : out_shape[0]; /* anchors */
+      /* Split-box output: determine features vs anchors using min-dimension heuristic.
+       * Features (4, 80, 32, …) are always << anchors (8400), so the smaller
+       * dimension is features regardless of which end it sits on:
+       *   TFLite (features-first): [4,8400]   → d0=4  < dlast=8400 → nf=4
+       *   Ara-2  (anchors-first):  [8400,4]   → d0=8400 > dlast=4  → nf=4 */
+      size_t d0    = (ndim >= 3 && out_shape[0] == 1) ? out_shape[1] : out_shape[0];
+      size_t dlast = out_shape[ndim - 1];
+      size_t nf = (d0 <= dlast) ? d0 : dlast;  /* features: smaller dim */
+      size_t nb = (d0 <= dlast) ? dlast : d0;  /* anchors:  larger dim  */
 
       /* Normalize to HAL [1, features, anchors] — matches add_split() in reference binary */
       out_shape[0] = 1; out_shape[1] = nf; out_shape[2] = nb;
