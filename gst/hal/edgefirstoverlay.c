@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #if HAVE_NNSTREAMER
 #include <nnstreamer_tensor_quant_meta.h>
@@ -136,10 +137,16 @@ struct _EdgefirstOverlay {
   /* HAL state */
   hal_image_processor   *processor;
   hal_decoder           *decoder;
-  hal_tensor            *display_images[2]; /* double-buffered RGBA render targets */
+  hal_tensor            *display_images[3]; /* triple-buffered RGBA render targets */
   guint                  display_buf_idx;   /* index of buffer to render into this frame */
   gboolean               display_is_dmabuf;
   GstAllocator          *dmabuf_allocator;
+
+  /* Inode-keyed cache of imported camera-frame HAL tensors. Each upstream
+   * dmabuf-fd pool reuses the same physical buffer across frames; caching
+   * by inode lets HAL keep the EGLImage handle warm and amortizes
+   * hal_import_image cost. Cache owns the tensors; freed in overlay_stop. */
+  GHashTable            *frame_tensor_cache;
 
   /* Video info */
   GstVideoInfo           in_info;
@@ -611,6 +618,13 @@ overlay_start (EdgefirstOverlay *self)
   self->flushing  = FALSE;
   self->decode_ts = GST_CLOCK_TIME_NONE;
 
+  /* Inode-keyed cache for camera-frame imports. Key is heap-allocated
+   * guint64 (the dmabuf inode), value is the borrowed hal_tensor. The
+   * cache owns both — destroyed in overlay_stop. */
+  self->frame_tensor_cache = g_hash_table_new_full (
+      g_int64_hash, g_int64_equal,
+      g_free, (GDestroyNotify) hal_tensor_free);
+
   return TRUE;
 }
 
@@ -626,10 +640,17 @@ overlay_stop (EdgefirstOverlay *self)
   self->decoder = NULL;
   self->tensor_count = 0;
 
+  /* Destroy frame cache before image processor — cached tensors hold
+   * EGLImage handles owned by the processor. */
+  if (self->frame_tensor_cache) {
+    g_hash_table_destroy (self->frame_tensor_cache);
+    self->frame_tensor_cache = NULL;
+  }
+
   hal_image_processor_free (self->processor);
   self->processor = NULL;
 
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     hal_tensor_free (self->display_images[i]);
     self->display_images[i] = NULL;
   }
@@ -734,6 +755,16 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
   if (!dims_str || !types_str)
     return FALSE;
 
+  /* NHWC_PROTOS.md diagnostic: print the raw NNStreamer dims/types string
+   * exactly as received, before any reversal / squeezing. Crucial for
+   * comparing physical proto layouts across backends (TFLite vs Ara-2 vs
+   * HailoRT): the innermost-first dim order here tells us whether the
+   * channel axis is 32 (NHWC physical, channels innermost) or one of the
+   * spatial dims (NCHW physical). */
+  GST_INFO_OBJECT (self,
+      "tensors CAPS raw: num_tensors=%d dimensions=\"%s\" types=\"%s\"",
+      num_tensors, dims_str, types_str);
+
   gchar **dim_parts  = g_strsplit (dims_str,  ",", num_tensors + 1);
   gchar **type_parts = g_strsplit (types_str, ",", num_tensors + 1);
 
@@ -751,14 +782,21 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
     self->tensor_dtypes[i] = nnstreamer_type_to_hal (type_parts[i]);
   }
 
-  /* Detect protos: a 3D tensor where the first two dims are spatial (both > 1)
-   * and the third is channels, e.g. [160, 160, 32]. Distinguish from detection
-   * tensors like [1, 8400, 4] where dim[0]=1 (batch). */
+  /* Detect protos: a 3D tensor where ALL three dims are > 1 (no degenerate
+   * axis). The channel dim is the smallest; spatial H/W are the larger two.
+   * Works for both NHWC ([H, W, C]) and NCHW ([C, H, W]) physical layouts. */
   for (gint i = 0; i < self->tensor_count; i++) {
     size_t nd = self->tensor_ndims[i];
-    if (nd == 3 && self->tensor_shapes[i][0] > 1 && self->tensor_shapes[i][1] > 1) {
+    if (nd != 3) continue;
+    size_t d0 = self->tensor_shapes[i][0];
+    size_t d1 = self->tensor_shapes[i][1];
+    size_t d2 = self->tensor_shapes[i][2];
+    if (d0 > 1 && d1 > 1 && d2 > 1) {
       has_protos = TRUE;
-      proto_channels = self->tensor_shapes[i][2];
+      /* Smallest dim is the channel count */
+      proto_channels = d0;
+      if (d1 < proto_channels) proto_channels = d1;
+      if (d2 < proto_channels) proto_channels = d2;
       break;
     }
   }
@@ -803,28 +841,48 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
 
     enum HalOutputType type;
 
-    /* Protos: 3D with spatial dims > 1. Two memory layouts are possible
-     * depending on the framework:
-     *   - TFLite / NHWC: [H, W, C]  — channels innermost
-     *   - Ara-2  / NCHW: [C, H, W]  — channels outermost
-     * Detect by the smallest dim (C is always << H, W for YOLOv8 protos)
-     * and label the axes to match the physical memory layout. HAL's
-     * `swap_axes_if_needed` then reorders to its canonical NHWC without
-     * touching the byte stream, and `protos_to_hwc` is a no-op.
+    /* Protos: 3D tensor with a small channel dimension relative to two
+     * equal-or-near-equal spatial dimensions. After parse_nnstreamer_dims
+     * (innermost-first → row-major reverse, trailing-1 squeeze) a well-
+     * formed proto tensor looks like one of:
+     *   NHWC physical — channels innermost: out_shape = [H, W, C],  C smallest
+     *   NCHW physical — channels outermost: out_shape = [C, H, W],  C smallest
      *
-     * Mislabeling (e.g. calling NHWC data NCHW) silently corrupts the
-     * stride computation in the fused dequant-dot-sigmoid kernel, so
-     * getting this right is load-bearing for mask rendering. */
-    gboolean is_protos = (ndim == 3 && out_shape[0] > 1 && out_shape[1] > 1);
+     * The declared tensor shape + dim names MUST match the physical byte
+     * order, because ndarray's ArrayView auto-computes C-contiguous strides
+     * from the declared shape. `swap_axes_if_needed` only permutes axis
+     * indices, not bytes — it cannot rescue a view that was wrapped with
+     * wrong strides. Mislabeling NHWC memory as NCHW silently shifts mask
+     * reads by a full row at every channel step, producing the vertical
+     * stripe artefacts documented in ~/hal/NHWC_PROTOS.md.
+     *
+     * Diagnostic capture on imx8mp-frdm (2026-04-22) with HAL 0.17.0 found
+     * both TFLite VX-delegate and Ara-2 DVM emit protos as dim string
+     * "32:160:160:1" — identical innermost-first ordering → both backends
+     * are NHWC physical. Detect layout by the smallest-dim position to
+     * remain correct if a future backend emits NCHW. */
+    gboolean is_protos = FALSE;
     gboolean protos_is_nhwc = FALSE;
 
+    if (ndim == 3 && out_shape[0] > 1 && out_shape[1] > 1 && out_shape[2] > 1) {
+      size_t d0 = out_shape[0], d1 = out_shape[1], d2 = out_shape[2];
+      if (d2 <= d0 && d2 <= d1) {
+        /* NHWC: channel axis is innermost → out_shape[H, W, C] */
+        out_shape[0] = 1; out_shape[1] = d0; out_shape[2] = d1; out_shape[3] = d2;
+        protos_is_nhwc = TRUE;
+        is_protos = TRUE;
+      } else if (d0 <= d1 && d0 <= d2) {
+        /* NCHW: channel axis is outermost → out_shape[C, H, W] */
+        out_shape[0] = 1; out_shape[1] = d0; out_shape[2] = d1; out_shape[3] = d2;
+        protos_is_nhwc = FALSE;
+        is_protos = TRUE;
+      }
+      /* Otherwise ambiguous (e.g. H, W, C all equal) — fall through as a
+       * non-protos tensor; HAL will reject the shape and we'll see a
+       * clear error rather than silent corruption. */
+    }
+
     if (is_protos) {
-      size_t H = out_shape[0], W = out_shape[1], C = out_shape[2];
-      /* Always emit [1, C, H, W] with NCHW dim labels. HAL's
-       * protos_to_hwc heuristic then permutes the view to HWC
-       * when C < H (the common case for YOLOv8 protos). */
-      out_shape[0] = 1; out_shape[1] = C; out_shape[2] = H; out_shape[3] = W;
-      protos_is_nhwc = FALSE;
       type = HAL_OUTPUT_TYPE_PROTOS;
       ndim = 4;
     } else if (has_split_boxes) {
@@ -899,11 +957,17 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
   hal_decoder_params_set_decoder_version (params, parse_decoder_version (self->decoder_version));
   hal_decoder_params_set_nms (params, HAL_NMS_CLASS_AGNOSTIC);
 
-  /* Infer model input size from protos spatial dims (160*4=640) or model_width property */
+  /* Infer model input size from protos spatial dims (160*4=640) or model_width property.
+   * Proto H axis position depends on declared layout:
+   *   NHWC [1, H, W, C] → H at axis 1
+   *   NCHW [1, C, H, W] → H at axis 2 */
   guint model_input_size = self->model_width > 0 ? self->model_width : 640;
   for (gint i = 0; i < self->tensor_count; i++) {
     if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS && self->hal_ndims[i] == 4) {
-      guint inferred = (guint) self->hal_shapes[i][2] * 4;  /* proto H * stride */
+      size_t proto_h = self->tensor_protos_is_nhwc[i]
+          ? self->hal_shapes[i][1]  /* H at axis 1 for NHWC */
+          : self->hal_shapes[i][2]; /* H at axis 2 for NCHW */
+      guint inferred = (guint) proto_h * 4;  /* proto H * stride */
       if (inferred > 0 && self->model_width == 0) {
         model_input_size = inferred;
         GST_INFO_OBJECT (self, "inferred model input size %u from protos", model_input_size);
@@ -936,8 +1000,18 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
     enum HalDimName dims[MAX_NDIM];
     switch (type) {
       case HAL_OUTPUT_TYPE_PROTOS:
-        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_NUM_PROTOS;
-        dims[2] = HAL_DIM_NAME_HEIGHT; dims[3] = HAL_DIM_NAME_WIDTH;
+        /* Dim names must match declared shape order, which must match the
+         * physical memory layout detected in overlay_parse_tensor_caps. */
+        dims[0] = HAL_DIM_NAME_BATCH;
+        if (self->tensor_protos_is_nhwc[i]) {
+          dims[1] = HAL_DIM_NAME_HEIGHT;
+          dims[2] = HAL_DIM_NAME_WIDTH;
+          dims[3] = HAL_DIM_NAME_NUM_PROTOS;
+        } else {
+          dims[1] = HAL_DIM_NAME_NUM_PROTOS;
+          dims[2] = HAL_DIM_NAME_HEIGHT;
+          dims[3] = HAL_DIM_NAME_WIDTH;
+        }
         break;
       case HAL_OUTPUT_TYPE_BOXES:
         dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_BOX_COORDS;
@@ -1064,6 +1138,59 @@ parse_class_colors (const gchar *str, uint8_t (**out_colors)[4])
 }
 
 /* ── Helper: create_input_image ──────────────────────────────────── */
+
+/* Forward declaration for the inode-cached wrapper below. */
+static hal_tensor *create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf);
+
+/* Resolve the camera-frame GstBuffer to a HAL tensor suitable for use as
+ * the `background` argument of draw_decoded_masks.
+ *
+ * For DMA-BUF inputs the same physical buffer is recycled across frames
+ * (v4l2src / v4l2h264dec / camera HAL pools). The dmabuf fd's inode
+ * uniquely identifies the underlying memory, so we cache the imported
+ * hal_tensor by inode — HAL's internal EGLImage stays warm and we avoid
+ * paying the import cost on every frame. The cache owns the tensor;
+ * callers must NOT free the returned pointer.
+ *
+ * For non-DMA inputs (memcpy fallback) we cannot cache because each
+ * frame's pixel data is in a fresh system-memory buffer; *out_owned is
+ * set to TRUE and the caller must hal_tensor_free() the result.
+ *
+ * Same import-once-per-fd pattern that edgefirstcameraadaptor and the
+ * yolov8n_seg_ara2 reference demo both use. */
+static hal_tensor *
+import_camera_frame_cached (EdgefirstOverlay *self, GstBuffer *inbuf,
+    gboolean *out_owned)
+{
+  *out_owned = FALSE;
+
+  GstMemory *mem = gst_buffer_peek_memory (inbuf, 0);
+  if (mem && gst_is_dmabuf_memory (mem) && self->frame_tensor_cache) {
+    int fd = gst_dmabuf_memory_get_fd (mem);
+    struct stat st;
+    if (fstat (fd, &st) == 0) {
+      gint64 ino = (gint64) st.st_ino;
+      hal_tensor *cached = g_hash_table_lookup (self->frame_tensor_cache, &ino);
+      if (cached) {
+        GST_LOG_OBJECT (self, "camera frame cache hit ino=%" G_GINT64_FORMAT, ino);
+        return cached;
+      }
+      hal_tensor *t = create_input_image (self, inbuf);
+      if (!t) return NULL;
+      gint64 *key = g_new (gint64, 1);
+      *key = ino;
+      g_hash_table_insert (self->frame_tensor_cache, key, t);
+      GST_INFO_OBJECT (self,
+          "camera frame cache miss ino=%" G_GINT64_FORMAT " — imported, %u entries",
+          ino, g_hash_table_size (self->frame_tensor_cache));
+      return t;
+    }
+  }
+
+  /* Non-DMA fallback or fstat failure: caller owns the tensor. */
+  *out_owned = TRUE;
+  return create_input_image (self, inbuf);
+}
 
 /* Create a HAL input tensor from a GstBuffer.
  * Tries DMABuf zero-copy via hal_import_image first; falls back to
@@ -1246,10 +1373,11 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
     g_free (colors);
   }
 
-  /* Allocate two display images for double-buffering.  The DMA-BUF clone path
-   * shares physical memory with display_image — double-buffering lets frame N's
-   * fd remain valid while frame N+1 is rendered into the other buffer. */
-  for (int i = 0; i < 2; i++) {
+  /* Allocate three display images for triple-buffering.  The DMA-BUF clone path
+   * shares physical memory with display_image — triple-buffering lets two
+   * downstream consumers (e.g. waylandsink holding the front buffer plus a
+   * queued back buffer) keep their fds valid while we render into the third. */
+  for (int i = 0; i < 3; i++) {
     hal_tensor_free (self->display_images[i]);
     guint64 t0 = _get_time_ns ();
     self->display_images[i] = hal_image_processor_create_image (self->processor,
@@ -1266,7 +1394,7 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
   }
   self->display_buf_idx = 0;
 
-  /* Probe DMA-BUF availability once; both images were allocated identically. */
+  /* Probe DMA-BUF availability once; all images were allocated identically. */
   int test_fd = hal_tensor_dmabuf_clone (self->display_images[0]);
   if (test_fd >= 0) {
     close (test_fd);
@@ -1275,9 +1403,14 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
     self->display_is_dmabuf = FALSE;
   }
 
-  GST_INFO_OBJECT (self, "display image %ux%u RGBA, dmabuf=%s (double-buffered)",
+  GST_INFO_OBJECT (self, "display image %ux%u RGBA, dmabuf=%s (triple-buffered)",
       self->display_w, self->display_h,
       self->display_is_dmabuf ? "yes" : "no");
+
+  /* Caps may be re-negotiated mid-stream (e.g. resolution change). Drop any
+   * cached camera-frame imports so we re-import against the new dimensions. */
+  if (self->frame_tensor_cache)
+    g_hash_table_remove_all (self->frame_tensor_cache);
 
   /* Forward plain video/x-raw RGBA caps downstream with framerate from input.
    * Do NOT advertise memory:DMABuf in caps — DMA-BUF backing is transparent.
@@ -1430,11 +1563,17 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
     g_mutex_unlock (&self->lock);
   }
 
-  /* ── Convert input to RGBA display_image ─────────────────────── */
-  /* Pick the current back buffer; front buffer (previous frame) is in flight. */
+  /* ── Import camera frame as background ────────────────────────── */
+  /* Pick the current back buffer in the triple-buffered ring; the other two
+   * may still be held by waylandsink (front + queued back). */
   hal_tensor *display_image = self->display_images[self->display_buf_idx];
 
-  hal_tensor *src_img = create_input_image (self, buf);
+  /* Import the upstream camera frame in its native pixel format (NV12, YUYV,
+   * RGBA, …). For DMA-BUF inputs this resolves through an inode cache so
+   * HAL keeps the EGLImage handle warm across frames; for the memcpy fallback
+   * a fresh tensor is allocated and we own it. */
+  gboolean src_owned = FALSE;
+  hal_tensor *src_img = import_camera_frame_cached (self, buf, &src_owned);
   if (!src_img) {
     g_clear_object (&boxes_snap);
     g_clear_object (&segs_snap);
@@ -1442,38 +1581,38 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
     return GST_FLOW_ERROR;
   }
 
-  guint64 t0_convert = _get_time_ns ();
-  int convert_ret = hal_image_processor_convert (self->processor, src_img,
-      display_image, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
-  guint64 t1_convert = _get_time_ns ();
-  GST_INFO_OBJECT (self, "hal_image_processor_convert took %.1f ms",
-      (t1_convert - t0_convert) / 1e6);
-  hal_tensor_free (src_img);
-
-  if (convert_ret != 0) {
-    GST_ERROR_OBJECT (self, "HAL convert failed (%d)", convert_ret);
-    g_clear_object (&boxes_snap);
-    g_clear_object (&segs_snap);
-    gst_buffer_unref (buf);
-    return GST_FLOW_ERROR;
-  }
-
-  /* ── Draw decoded masks ───────────────────────────────────────── */
+  /* ── Composite: background blit + masks (always) ──────────────── */
+  /* HAL >= 0.16.4 always writes the full output frame:
+   *   no boxes/segs       → dst ← bg                  (camera passthrough)
+   *   boxes/segs present  → dst ← bg + mask layer     (overlay composite)
+   * Calling draw_decoded_masks on every video buffer keeps the display fresh
+   * even before the first inference completes, instead of leaving stale
+   * pixels in the recycled triple-buffered canvas. */
   hal_detect_box_list    *boxes_hal = edgefirst_detect_box_list_get_hal (boxes_snap);
   hal_segmentation_list  *segs_hal  = edgefirst_segmentation_list_get_hal (segs_snap);
 
-  if (boxes_hal || segs_hal) {
-    guint64 t0_draw = _get_time_ns ();
-    hal_image_processor_draw_decoded_masks (self->processor, display_image,
-        boxes_hal, segs_hal, NULL, self->opacity,
-        overlay_effective_letterbox (self),
-        (enum hal_color_mode) self->color_mode);
-    guint64 t1_draw = _get_time_ns ();
-    GST_INFO_OBJECT (self, "draw_decoded_masks: %.1f ms", (t1_draw - t0_draw) / 1e6);
-  }
+  guint64 t0_draw = _get_time_ns ();
+  int draw_ret = hal_image_processor_draw_decoded_masks (self->processor,
+      display_image, boxes_hal, segs_hal, src_img, self->opacity,
+      overlay_effective_letterbox (self),
+      (enum hal_color_mode) self->color_mode);
+  guint64 t1_draw = _get_time_ns ();
+  GST_INFO_OBJECT (self,
+      "draw_decoded_masks: %.1f ms (boxes=%s segs=%s ret=%d)",
+      (t1_draw - t0_draw) / 1e6,
+      boxes_hal ? "yes" : "no", segs_hal ? "yes" : "no", draw_ret);
+
+  if (src_owned)
+    hal_tensor_free (src_img);
 
   g_clear_object (&boxes_snap);
   g_clear_object (&segs_snap);
+
+  if (draw_ret != 0) {
+    GST_ERROR_OBJECT (self, "HAL draw_decoded_masks failed (%d)", draw_ret);
+    gst_buffer_unref (buf);
+    return GST_FLOW_ERROR;
+  }
 
   /* ── Wrap display_image as output GstBuffer ───────────────────── */
   GstBuffer *outbuf = NULL;
@@ -1490,9 +1629,10 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
       outbuf = gst_buffer_new ();
       gst_buffer_append_memory (outbuf,
           gst_dmabuf_allocator_alloc (self->dmabuf_allocator, fd, row_stride * h));
-      /* Advance to the other buffer so the next frame renders there while
-       * downstream (waylandsink) holds the current frame's DMA-BUF fd. */
-      self->display_buf_idx = (self->display_buf_idx + 1) % 2;
+      /* Advance through the triple-buffered ring so the next frame renders
+       * into a free slot while downstream (waylandsink) holds the current
+       * frame's DMA-BUF fd plus optionally a queued back buffer. */
+      self->display_buf_idx = (self->display_buf_idx + 1) % 3;
       dmabuf_ok = TRUE;
     }
   }
