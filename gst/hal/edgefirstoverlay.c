@@ -858,9 +858,19 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
      *
      * Diagnostic capture on imx8mp-frdm (2026-04-22) with HAL 0.17.0 found
      * both TFLite VX-delegate and Ara-2 DVM emit protos as dim string
-     * "32:160:160:1" — identical innermost-first ordering → both backends
-     * are NHWC physical. Detect layout by the smallest-dim position to
-     * remain correct if a future backend emits NCHW. */
+     * "32:160:160:1". However, this identical string has DIFFERENT physical
+     * meanings per backend:
+     *   TFLite: genuinely innermost-first -> reversed [160,160,32] -> NHWC
+     *   Ara-2:  reports native CHW tuple, NOT innermost-first -> reversed
+     *           [160,160,32] -> NHWC detection, but actual memory is NCHW
+     *
+     * The Ara-2 case is corrected later in overlay_try_metadata_decoder()
+     * which flips protos_is_nhwc -> FALSE and swaps the HAL shape to NCHW
+     * when model-metadata is found upstream (see ~/validator KinaraRunner
+     * _normalize_shape which uses ARA-2 native CHW without reversal).
+     *
+     * Detect layout by the smallest-dim position; the metadata path
+     * overrides if the initial guess is wrong for the backend. */
     gboolean is_protos = FALSE;
     gboolean protos_is_nhwc = FALSE;
 
@@ -945,12 +955,161 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
   return TRUE;
 }
 
+/* ── Model-metadata path ─────────────────────────────────────────── */
+
+/* Traverse upstream from the tensors sink pad to find a tensor_filter
+ * element and retrieve its model-metadata property (JSON string).
+ * Returns a newly-allocated string, or NULL if not found. */
+static gchar *
+overlay_query_model_metadata (EdgefirstOverlay *self)
+{
+  GstPad *peer = gst_pad_get_peer (self->tensors_sinkpad);
+  if (!peer)
+    return NULL;
+
+  /* Walk up to MAX_HOPS elements upstream looking for model-metadata */
+  GstElement *el = GST_PAD_PARENT (peer);
+  gst_object_unref (peer);
+
+  for (gint hop = 0; hop < 8 && el != NULL; hop++) {
+    /* Check if this element has the model-metadata property */
+    GParamSpec *pspec = g_object_class_find_property (
+        G_OBJECT_GET_CLASS (el), "model-metadata");
+    if (pspec && G_IS_PARAM_SPEC_STRING (pspec)) {
+      gchar *meta = NULL;
+      g_object_get (el, "model-metadata", &meta, NULL);
+      if (meta && meta[0] != '\0') {
+        GST_INFO_OBJECT (self,
+            "found model-metadata from upstream element '%s' (%zu bytes)",
+            GST_ELEMENT_NAME (el), strlen (meta));
+        return meta;
+      }
+      g_free (meta);
+    }
+
+    /* Move to the next upstream element */
+    GstPad *sink = gst_element_get_static_pad (el, "sink");
+    if (!sink)
+      break;
+    GstPad *up_peer = gst_pad_get_peer (sink);
+    gst_object_unref (sink);
+    if (!up_peer)
+      break;
+    el = GST_PAD_PARENT (up_peer);
+    gst_object_unref (up_peer);
+  }
+
+  return NULL;
+}
+
+/* Try to create a HAL decoder from upstream model-metadata JSON.
+ * Returns TRUE if decoder was created, FALSE if metadata not available
+ * or decoder creation failed (in which case an error is posted). */
+static gboolean
+overlay_try_metadata_decoder (EdgefirstOverlay *self)
+{
+  gchar *meta_json = overlay_query_model_metadata (self);
+  if (!meta_json)
+    return FALSE;
+
+  GST_INFO_OBJECT (self, "creating decoder from model-metadata (config-based path)");
+
+  struct hal_decoder_params *params = hal_decoder_params_new ();
+  hal_decoder_params_set_config_json (params, meta_json, strlen (meta_json));
+  hal_decoder_params_set_score_threshold (params, self->score_threshold);
+  hal_decoder_params_set_iou_threshold (params, self->iou_threshold);
+
+  self->decoder = hal_decoder_new (params);
+  hal_decoder_params_free (params);
+  g_free (meta_json);
+
+  if (!self->decoder) {
+    GST_ERROR_OBJECT (self,
+        "model-metadata present but decoder creation failed (%s); "
+        "NOT falling back to auto-config", strerror (errno));
+    return TRUE;  /* metadata was present — do not fall back */
+  }
+
+  /* When model-metadata provides the decoder configuration, it is the
+   * authoritative source for the normalized flag. The per-output
+   * quantization and coordinate convention are baked into the schema.
+   * Always use the decoder's value — ignore the property override. */
+  self->normalized = hal_decoder_normalized_boxes (self->decoder);
+
+  /* Correct protos tensor shape for Ara-2 backend.
+   *
+   * Background: parse_nnstreamer_dims() reverses NNStreamer's dimension
+   * string assuming innermost-first convention. This is correct for TFLite
+   * (NHWC physical), but Ara-2's tensor_filter reports dimensions in its
+   * native CHW order -- NOT innermost-first. The reversal turns CHW into
+   * what looks like HWC, causing NHWC detection for actually-NCHW memory.
+   *
+   * The validator (~/validator KinaraRunner._normalize_shape) queries Ara-2
+   * shapes directly via output_shape() and uses them in CHW order without
+   * reversal, confirming that Ara-2 memory is NCHW.
+   *
+   * For 2D tensors (scores, boxes, mask_coefs), the pass-2 min/max
+   * normalization produces correct [1, features, anchors] shapes regardless
+   * of dim ordering. Only the 3D protos tensor is affected because its
+   * NHWC/NCHW classification depends on which end the channel axis lands on
+   * after the (incorrect for Ara-2) reversal.
+   *
+   * Fix: swap protos from NHWC [1, H, W, C] to NCHW [1, C, H, W] to match
+   * the actual Ara-2 memory layout and the v2 schema's declared shape. */
+  for (gint i = 0; i < self->tensor_count; i++) {
+    if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS
+        && self->tensor_protos_is_nhwc[i]
+        && self->hal_ndims[i] == 4) {
+      size_t h = self->hal_shapes[i][1];
+      size_t w = self->hal_shapes[i][2];
+      size_t c = self->hal_shapes[i][3];
+      self->hal_shapes[i][1] = c;
+      self->hal_shapes[i][2] = h;
+      self->hal_shapes[i][3] = w;
+      self->tensor_protos_is_nhwc[i] = FALSE;
+      GST_INFO_OBJECT (self,
+          "corrected protos[%d] to NCHW [1,%zu,%zu,%zu] for Ara-2 memory layout",
+          i, c, h, w);
+    }
+  }
+
+  /* Compute model input size from (now-corrected) protos if not already set */
+  if (self->model_width == 0 || self->model_height == 0) {
+    for (gint i = 0; i < self->tensor_count; i++) {
+      if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS && self->hal_ndims[i] == 4) {
+        /* NCHW: H at index 2, or NHWC (shouldn't reach here): H at index 1 */
+        size_t proto_h = self->tensor_protos_is_nhwc[i]
+            ? self->hal_shapes[i][1] : self->hal_shapes[i][2];
+        guint inferred = (guint) proto_h * 4;
+        if (inferred > 0) {
+          if (self->model_width == 0) self->model_width = inferred;
+          if (self->model_height == 0) self->model_height = inferred;
+          GST_INFO_OBJECT (self, "inferred model size %u from protos", inferred);
+        }
+        break;
+      }
+    }
+  }
+
+
+  GST_INFO_OBJECT (self, "decoder created from model-metadata: normalized=%d",
+      self->normalized);
+  return TRUE;
+}
+
 /* Phase 2: Create the HAL decoder from cached shapes + quant params from buffer.
  * Called from the first tensor chain invocation where the buffer is available
  * for GstNnsTensorQuantMeta extraction. */
 static gboolean
 overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
 {
+  /* ── Priority 1: model-metadata from upstream tensor_filter ────── */
+  if (overlay_try_metadata_decoder (self))
+    return self->decoder != NULL;
+
+  /* ── Priority 2: auto-config from tensor caps + quant meta ─────── */
+  GST_INFO_OBJECT (self, "no model-metadata found, using auto-config path");
+
   struct hal_decoder_params *params = hal_decoder_params_new ();
   hal_decoder_params_set_score_threshold (params, self->score_threshold);
   hal_decoder_params_set_iou_threshold   (params, self->iou_threshold);
