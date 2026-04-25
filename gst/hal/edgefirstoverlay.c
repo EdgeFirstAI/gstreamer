@@ -1220,10 +1220,11 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
     return FALSE;
   }
 
-  if (self->normalized_prop == OVERLAY_NORMALIZED_AUTO)
-    self->normalized = hal_decoder_normalized_boxes (self->decoder);
-  else
-    self->normalized = (self->normalized_prop == OVERLAY_NORMALIZED_TRUE);
+  /* After scale adjustment (line 1204), the decoder was told boxes are
+   * normalized (line 1172) and the quant scale was divided by model_input_size.
+   * So regardless of the user's `normalized` property, the decoded boxes
+   * ARE in [0,1].  Always query the decoder for the ground truth. */
+  self->normalized = hal_decoder_normalized_boxes (self->decoder);
 
   GST_INFO_OBJECT (self, "decoder created: %d tensors, normalized=%d, "
       "quant_meta=%s", self->tensor_count, self->normalized,
