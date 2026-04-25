@@ -3,8 +3,8 @@
  * Copyright (C) 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * Dual-sink GstElement: accepts video + other/tensors, runs HAL >= 0.16.3
- * decode->materialize->draw pipeline, emits new-detection signal.
+ * Dual-sink GstElement: accepts video + other/tensors, runs HAL >= 0.17.0
+ * decode->draw_proto_masks (GPU fused) pipeline, emits new-detection signal.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -159,6 +159,11 @@ struct _EdgefirstOverlay {
   GCond                  decode_cond;
   EdgeFirstDetectBoxList    *boxes_obj;       /* NULL until first tensor */
   EdgeFirstSegmentationList *segs_obj;        /* NULL for det-only models */
+  /* Fused proto path: stored from tensor chain, consumed in video chain.
+   * When proto_snap is non-NULL, draw_proto_masks is used (GPU-accelerated
+   * full-res rendering). When NULL, falls back to draw_decoded_masks with
+   * pre-materialized segs_obj (low-res 160×160 upsampled). */
+  struct hal_proto_data  *proto_snap;         /* owned, NULL if det-only */
   GstClockTime           decode_ts;
   gboolean               flushing;
   gboolean               normalized;         /* TRUE if decoder outputs [0,1] coords */
@@ -400,6 +405,7 @@ edgefirst_overlay_finalize (GObject *object)
   /* HAL and GObjects freed in stop(); clear in case finalize is called early */
   g_clear_object (&self->boxes_obj);
   g_clear_object (&self->segs_obj);
+  if (self->proto_snap) { hal_proto_data_free (self->proto_snap); self->proto_snap = NULL; }
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -658,6 +664,7 @@ overlay_stop (EdgefirstOverlay *self)
   g_mutex_lock (&self->lock);
   g_clear_object (&self->boxes_obj);
   g_clear_object (&self->segs_obj);
+  if (self->proto_snap) { hal_proto_data_free (self->proto_snap); self->proto_snap = NULL; }
   g_mutex_unlock (&self->lock);
 
   g_mutex_clear (&self->lock);
@@ -1056,6 +1063,7 @@ overlay_try_metadata_decoder (EdgefirstOverlay *self)
    *
    * Fix: swap protos from NHWC [1, H, W, C] to NCHW [1, C, H, W] to match
    * the actual Ara-2 memory layout and the v2 schema's declared shape. */
+  gboolean corrected_native_dims = FALSE;
   for (gint i = 0; i < self->tensor_count; i++) {
     if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS
         && self->tensor_protos_is_nhwc[i]
@@ -1067,9 +1075,51 @@ overlay_try_metadata_decoder (EdgefirstOverlay *self)
       self->hal_shapes[i][2] = h;
       self->hal_shapes[i][3] = w;
       self->tensor_protos_is_nhwc[i] = FALSE;
+      corrected_native_dims = TRUE;
       GST_INFO_OBJECT (self,
           "corrected protos[%d] to NCHW [1,%zu,%zu,%zu] for Ara-2 memory layout",
           i, c, h, w);
+    }
+  }
+
+  /* Correct detection tensor shapes for Ara-2 native dimension ordering.
+   *
+   * Ara-2's tensor_filter reports dimensions in native C-contiguous order
+   * (outermost first), NOT NNStreamer's standard innermost-first convention.
+   * parse_nnstreamer_dims() reverses the dim string, which turns the native
+   * [features, padding, anchors, batch] into [anchors, features] (2D).
+   * The fused-detection normalizer prepends batch: [1, anchors, features].
+   *
+   * But the actual DMA-BUF memory is C-contiguous in native order:
+   *   scores:     [80, 1, 8400, 1] → byte at offset c*8400+a for class c, anchor a
+   *   mask_coefs: [32, 1, 8400, 1] → byte at offset c*8400+a for coef c, anchor a
+   *   boxes:      [2, 1, 8400, 1]  → byte at offset d*8400+a for coord d, anchor a
+   *
+   * Wrapping with [1, anchors, features] creates C-contiguous strides
+   * [anchors*features, features, 1] — element [0,a,f] reads offset a*f_count+f,
+   * which is the WRONG byte for class=f, anchor=a.
+   *
+   * Fix: swap to [1, features, anchors] — matching the native binary's
+   * hal_shapes computation: {1, ns[1], ns[0]} (yolov8n_seg_ara2.cpp:264).
+   * Element [0,f,a] then reads offset f*anchors+a which correctly maps to
+   * the native memory layout.
+   *
+   * The protos NCHW correction above is the reliable signal that Ara-2
+   * native dim ordering is in effect. When protos needed correction, all
+   * detection tensors need the same treatment. */
+  if (corrected_native_dims) {
+    for (gint i = 0; i < self->tensor_count; i++) {
+      if (self->tensor_types[i] != HAL_OUTPUT_TYPE_PROTOS
+          && self->hal_ndims[i] == 3
+          && self->hal_shapes[i][0] == 1) {
+        size_t d1 = self->hal_shapes[i][1];
+        size_t d2 = self->hal_shapes[i][2];
+        self->hal_shapes[i][1] = d2;
+        self->hal_shapes[i][2] = d1;
+        GST_INFO_OBJECT (self,
+            "corrected tensor[%d] to [1,%zu,%zu] for Ara-2 native dim ordering",
+            i, d2, d1);
+      }
     }
   }
 
@@ -1712,13 +1762,32 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
 
   /* Snapshot decoded results under lock.
    * When model_sync=TRUE the mutex is still held from the wait loop above;
-   * when model_sync=FALSE we acquire it here. Either way we release it below. */
+   * when model_sync=FALSE we acquire it here. Either way we release it below.
+   *
+   * Proto path: when proto_snap is set (segmentation model with v2 schema),
+   * we borrow it for draw_proto_masks. The proto_snap pointer remains valid
+   * as long as the lock is held or until the tensor chain replaces it.
+   * Since draw_proto_masks is fast (~14ms GPU) and we hold the proto_snap
+   * pointer only for the duration of the draw call, there is no risk of the
+   * tensor chain freeing it underneath us — the tensor chain acquires the
+   * lock before replacing proto_snap.
+   *
+   * Important: proto_snap is NOT ref-counted. We must NOT hold the lock
+   * during draw (GPU work can take >10ms). Instead, we "borrow" the pointer
+   * atomically and set it to NULL so the tensor chain won't free it while
+   * we're using it. We re-store it after drawing. */
   EdgeFirstDetectBoxList    *boxes_snap = NULL;
   EdgeFirstSegmentationList *segs_snap  = NULL;
+  struct hal_proto_data     *proto_draw = NULL;
   {
     if (!self->model_sync) g_mutex_lock (&self->lock);
     boxes_snap = self->boxes_obj ? g_object_ref (self->boxes_obj) : NULL;
     segs_snap  = self->segs_obj  ? g_object_ref (self->segs_obj)  : NULL;
+    /* Borrow proto_snap: take ownership temporarily, tensor chain will
+     * allocate a new one on next decode. This avoids holding the lock
+     * during the GPU draw call. */
+    proto_draw = self->proto_snap;
+    self->proto_snap = NULL;
     g_mutex_unlock (&self->lock);
   }
 
@@ -1741,25 +1810,58 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   }
 
   /* ── Composite: background blit + masks (always) ──────────────── */
-  /* HAL >= 0.16.4 always writes the full output frame:
-   *   no boxes/segs       → dst ← bg                  (camera passthrough)
-   *   boxes/segs present  → dst ← bg + mask layer     (overlay composite)
-   * Calling draw_decoded_masks on every video buffer keeps the display fresh
-   * even before the first inference completes, instead of leaving stale
-   * pixels in the recycled triple-buffered canvas. */
+  /* HAL >= 0.17.0 supports two rendering paths:
+   *   1. draw_proto_masks: GPU-accelerated, computes mask_coeff @ protos
+   *      at full output resolution with bilinear sampling → smooth masks.
+   *   2. draw_decoded_masks: takes pre-materialized 160×160 masks from CPU
+   *      materialization → upsampled by GPU → blockier but works for all models.
+   *
+   * The proto path is used when proto_draw is available (seg models with v2
+   * schema). The decoded path is the fallback for detection-only models or
+   * when no proto_data was produced (legacy path, or before first tensor). */
   hal_detect_box_list    *boxes_hal = edgefirst_detect_box_list_get_hal (boxes_snap);
-  hal_segmentation_list  *segs_hal  = edgefirst_segmentation_list_get_hal (segs_snap);
 
   guint64 t0_draw = _get_time_ns ();
-  int draw_ret = hal_image_processor_draw_decoded_masks (self->processor,
-      display_image, boxes_hal, segs_hal, src_img, self->opacity,
-      overlay_effective_letterbox (self),
-      (enum hal_color_mode) self->color_mode);
+  int draw_ret;
+
+  if (proto_draw && boxes_hal) {
+    /* Fused GPU path: decode was done in tensor chain, rendering with
+     * full-resolution protos→mask matmul on GPU. */
+    draw_ret = hal_image_processor_draw_proto_masks (self->processor,
+        display_image, boxes_hal, proto_draw, src_img, self->opacity,
+        overlay_effective_letterbox (self),
+        (enum hal_color_mode) self->color_mode);
+  } else {
+    /* Legacy path: pre-materialized masks (or no masks at all) */
+    hal_segmentation_list *segs_hal = edgefirst_segmentation_list_get_hal (segs_snap);
+    draw_ret = hal_image_processor_draw_decoded_masks (self->processor,
+        display_image, boxes_hal, segs_hal, src_img, self->opacity,
+        overlay_effective_letterbox (self),
+        (enum hal_color_mode) self->color_mode);
+  }
+
   guint64 t1_draw = _get_time_ns ();
   GST_INFO_OBJECT (self,
-      "draw_decoded_masks: %.1f ms (boxes=%s segs=%s ret=%d)",
+      "%s: %.1f ms (boxes=%s proto=%s ret=%d)",
+      proto_draw ? "draw_proto_masks" : "draw_decoded_masks",
       (t1_draw - t0_draw) / 1e6,
-      boxes_hal ? "yes" : "no", segs_hal ? "yes" : "no", draw_ret);
+      boxes_hal ? "yes" : "no", proto_draw ? "yes" : "no", draw_ret);
+
+  /* Return proto_draw to storage for reuse on subsequent video frames.
+   * The tensor chain may have already stored a newer proto_snap — if so,
+   * free the stale one we just used. */
+  {
+    g_mutex_lock (&self->lock);
+    if (self->proto_snap) {
+      /* Tensor chain produced a newer proto while we were drawing — discard ours */
+      hal_proto_data_free (proto_draw);
+    } else {
+      /* No newer data — put ours back for the next video frame */
+      self->proto_snap = proto_draw;
+    }
+    g_mutex_unlock (&self->lock);
+    proto_draw = NULL;  /* ownership transferred */
+  }
 
   if (src_owned)
     hal_tensor_free (src_img);
@@ -1768,7 +1870,7 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   g_clear_object (&segs_snap);
 
   if (draw_ret != 0) {
-    GST_ERROR_OBJECT (self, "HAL draw_decoded_masks failed (%d)", draw_ret);
+    GST_ERROR_OBJECT (self, "HAL draw masks failed (%d)", draw_ret);
     gst_buffer_unref (buf);
     return GST_FLOW_ERROR;
   }
@@ -1967,19 +2069,22 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
       (t1_decode - t0_decode) / 1e6, n_boxes,
       proto ? ", has protos" : "");
 
-  /* ── Materialize masks ───────────────────────────────────────────── */
+  /* ── Store proto_data for fused GPU rendering in video chain ──── */
+  /* When proto_data is available, we store it directly for the video chain
+   * to use with draw_proto_masks() — the GPU-accelerated path that computes
+   * mask_coeff @ protos at full output resolution with bilinear sampling.
+   *
+   * Fallback: if no proto_data (detection-only model), we still need
+   * materialized segmentations for draw_decoded_masks(). */
   hal_segmentation_list *new_segs = NULL;
   if (proto) {
-    guint64 t0_mat = _get_time_ns ();
-    new_segs = hal_image_processor_materialize_masks (self->processor,
-        new_boxes, proto, overlay_effective_letterbox (self));
-    guint64 t1_mat = _get_time_ns ();
-    GST_INFO_OBJECT (self, "materialize_masks: %.1f ms (%s)",
-        (t1_mat - t0_mat) / 1e6, new_segs ? "ok" : "none");
-    hal_proto_data_free (proto);
+    /* Fused path: keep proto_data alive for video chain */
+    GST_DEBUG_OBJECT (self, "storing proto_data for fused draw_proto_masks path");
+  } else {
+    /* Detection-only: no protos, no segs — boxes only */
   }
 
-  /* ── Wrap in GObjects ────────────────────────────────────────────── */
+  /* ── Wrap in GObjects (for signal + legacy segs_obj) ──────────── */
   guint mw = self->model_width  > 0 ? self->model_width  : 0;
   guint mh = self->model_height > 0 ? self->model_height : 0;
   EdgeFirstDetectBoxList    *boxes_obj = edgefirst_detect_box_list_new_normalized (
@@ -1993,6 +2098,13 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   g_clear_object (&self->segs_obj);
   self->boxes_obj = g_object_ref (boxes_obj);
   self->segs_obj  = segs_obj ? g_object_ref (segs_obj) : NULL;
+
+  /* Store raw HAL proto_data for fused video-chain rendering.
+   * The video chain will use draw_proto_masks() when proto_snap is set,
+   * falling back to draw_decoded_masks() when proto_snap is NULL. */
+  if (self->proto_snap) hal_proto_data_free (self->proto_snap);
+  self->proto_snap = proto;         /* transfer ownership */
+
   if (GST_BUFFER_PTS (buf) != GST_CLOCK_TIME_NONE)
     self->decode_ts = GST_BUFFER_PTS (buf);
   g_cond_signal (&self->decode_cond);
