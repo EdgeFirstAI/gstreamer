@@ -206,7 +206,6 @@ struct _EdgefirstOverlay {
   gchar     *class_colors;
   OverlayCompute compute;
   OverlayNormalized normalized_prop;  /* user-facing tri-state property */
-  gchar     *upstream_framework;      /* tensor_filter framework (e.g. "ara2") */
 };
 
 /* ── Pad templates ───────────────────────────────────────────────── */
@@ -401,7 +400,6 @@ edgefirst_overlay_finalize (GObject *object)
   g_free (self->decoder_version);
   g_free (self->letterbox_str);
   g_free (self->class_colors);
-  g_free (self->upstream_framework);
   gst_object_unref (self->dmabuf_allocator);
 
   /* HAL and GObjects freed in stop(); clear in case finalize is called early */
@@ -991,17 +989,6 @@ overlay_query_model_metadata (EdgefirstOverlay *self)
         GST_INFO_OBJECT (self,
             "found model-metadata from upstream element '%s' (%zu bytes)",
             GST_ELEMENT_NAME (el), strlen (meta));
-
-        /* Also capture the framework property for backend-specific handling */
-        GParamSpec *fw_pspec = g_object_class_find_property (
-            G_OBJECT_GET_CLASS (el), "framework");
-        if (fw_pspec && G_IS_PARAM_SPEC_STRING (fw_pspec)) {
-          g_free (self->upstream_framework);
-          g_object_get (el, "framework", &self->upstream_framework, NULL);
-          GST_INFO_OBJECT (self, "upstream tensor_filter framework: '%s'",
-              self->upstream_framework ? self->upstream_framework : "(null)");
-        }
-
         return meta;
       }
       g_free (meta);
@@ -1056,99 +1043,11 @@ overlay_try_metadata_decoder (EdgefirstOverlay *self)
    * Always use the decoder's value — ignore the property override. */
   self->normalized = hal_decoder_normalized_boxes (self->decoder);
 
-  /* Correct protos tensor shape for Ara-2 backend.
-   *
-   * Background: parse_nnstreamer_dims() reverses NNStreamer's dimension
-   * string assuming innermost-first convention. This is correct for TFLite
-   * (NHWC physical), but Ara-2's tensor_filter reports dimensions in its
-   * native CHW order -- NOT innermost-first. The reversal turns CHW into
-   * what looks like HWC, causing NHWC detection for actually-NCHW memory.
-   *
-   * The validator (~/validator KinaraRunner._normalize_shape) queries Ara-2
-   * shapes directly via output_shape() and uses them in CHW order without
-   * reversal, confirming that Ara-2 memory is NCHW.
-   *
-   * For 2D tensors (scores, boxes, mask_coefs), the pass-2 min/max
-   * normalization produces correct [1, features, anchors] shapes regardless
-   * of dim ordering. Only the 3D protos tensor is affected because its
-   * NHWC/NCHW classification depends on which end the channel axis lands on
-   * after the (incorrect for Ara-2) reversal.
-   *
-   * Fix: swap protos from NHWC [1, H, W, C] to NCHW [1, C, H, W] to match
-   * the actual Ara-2 memory layout and the v2 schema's declared shape.
-   *
-   * Gate: only apply when upstream framework is "ara2". TFLite reports
-   * dims innermost-first, so the reversal in parse_nnstreamer_dims() is
-   * correct and the resulting NHWC shape matches physical memory. */
-  gboolean is_ara2 = self->upstream_framework
-      && g_ascii_strcasecmp (self->upstream_framework, "ara2") == 0;
-  gboolean corrected_native_dims = FALSE;
-  if (is_ara2) {
-  for (gint i = 0; i < self->tensor_count; i++) {
-    if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS
-        && self->tensor_protos_is_nhwc[i]
-        && self->hal_ndims[i] == 4) {
-      size_t h = self->hal_shapes[i][1];
-      size_t w = self->hal_shapes[i][2];
-      size_t c = self->hal_shapes[i][3];
-      self->hal_shapes[i][1] = c;
-      self->hal_shapes[i][2] = h;
-      self->hal_shapes[i][3] = w;
-      self->tensor_protos_is_nhwc[i] = FALSE;
-      corrected_native_dims = TRUE;
-      GST_INFO_OBJECT (self,
-          "corrected protos[%d] to NCHW [1,%zu,%zu,%zu] for Ara-2 memory layout",
-          i, c, h, w);
-    }
-  }
-
-  /* Correct detection tensor shapes for Ara-2 native dimension ordering.
-   *
-   * Ara-2's tensor_filter reports dimensions in native C-contiguous order
-   * (outermost first), NOT NNStreamer's standard innermost-first convention.
-   * parse_nnstreamer_dims() reverses the dim string, which turns the native
-   * [features, padding, anchors, batch] into [anchors, features] (2D).
-   * The fused-detection normalizer prepends batch: [1, anchors, features].
-   *
-   * But the actual DMA-BUF memory is C-contiguous in native order:
-   *   scores:     [80, 1, 8400, 1] → byte at offset c*8400+a for class c, anchor a
-   *   mask_coefs: [32, 1, 8400, 1] → byte at offset c*8400+a for coef c, anchor a
-   *   boxes:      [2, 1, 8400, 1]  → byte at offset d*8400+a for coord d, anchor a
-   *
-   * Wrapping with [1, anchors, features] creates C-contiguous strides
-   * [anchors*features, features, 1] — element [0,a,f] reads offset a*f_count+f,
-   * which is the WRONG byte for class=f, anchor=a.
-   *
-   * Fix: swap to [1, features, anchors] — matching the native binary's
-   * hal_shapes computation: {1, ns[1], ns[0]} (yolov8n_seg_ara2.cpp:264).
-   * Element [0,f,a] then reads offset f*anchors+a which correctly maps to
-   * the native memory layout.
-   *
-   * The protos NCHW correction above is the reliable signal that Ara-2
-   * native dim ordering is in effect. When protos needed correction, all
-   * detection tensors need the same treatment. */
-  if (corrected_native_dims) {
-    for (gint i = 0; i < self->tensor_count; i++) {
-      if (self->tensor_types[i] != HAL_OUTPUT_TYPE_PROTOS
-          && self->hal_ndims[i] == 3
-          && self->hal_shapes[i][0] == 1) {
-        size_t d1 = self->hal_shapes[i][1];
-        size_t d2 = self->hal_shapes[i][2];
-        self->hal_shapes[i][1] = d2;
-        self->hal_shapes[i][2] = d1;
-        GST_INFO_OBJECT (self,
-            "corrected tensor[%d] to [1,%zu,%zu] for Ara-2 native dim ordering",
-            i, d2, d1);
-      }
-    }
-  }
-  } /* is_ara2 */
-
-  /* Compute model input size from (now-corrected) protos if not already set */
+  /* Compute model input size from protos if not already set */
   if (self->model_width == 0 || self->model_height == 0) {
     for (gint i = 0; i < self->tensor_count; i++) {
       if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS && self->hal_ndims[i] == 4) {
-        /* NCHW: H at index 2, or NHWC (shouldn't reach here): H at index 1 */
+        /* NCHW: H at index 2, or NHWC: H at index 1 */
         size_t proto_h = self->tensor_protos_is_nhwc[i]
             ? self->hal_shapes[i][1] : self->hal_shapes[i][2];
         guint inferred = (guint) proto_h * 4;
