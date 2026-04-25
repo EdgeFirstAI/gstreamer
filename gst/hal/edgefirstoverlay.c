@@ -206,6 +206,7 @@ struct _EdgefirstOverlay {
   gchar     *class_colors;
   OverlayCompute compute;
   OverlayNormalized normalized_prop;  /* user-facing tri-state property */
+  gchar     *upstream_framework;      /* tensor_filter framework (e.g. "ara2") */
 };
 
 /* ── Pad templates ───────────────────────────────────────────────── */
@@ -400,6 +401,7 @@ edgefirst_overlay_finalize (GObject *object)
   g_free (self->decoder_version);
   g_free (self->letterbox_str);
   g_free (self->class_colors);
+  g_free (self->upstream_framework);
   gst_object_unref (self->dmabuf_allocator);
 
   /* HAL and GObjects freed in stop(); clear in case finalize is called early */
@@ -989,6 +991,17 @@ overlay_query_model_metadata (EdgefirstOverlay *self)
         GST_INFO_OBJECT (self,
             "found model-metadata from upstream element '%s' (%zu bytes)",
             GST_ELEMENT_NAME (el), strlen (meta));
+
+        /* Also capture the framework property for backend-specific handling */
+        GParamSpec *fw_pspec = g_object_class_find_property (
+            G_OBJECT_GET_CLASS (el), "framework");
+        if (fw_pspec && G_IS_PARAM_SPEC_STRING (fw_pspec)) {
+          g_free (self->upstream_framework);
+          g_object_get (el, "framework", &self->upstream_framework, NULL);
+          GST_INFO_OBJECT (self, "upstream tensor_filter framework: '%s'",
+              self->upstream_framework ? self->upstream_framework : "(null)");
+        }
+
         return meta;
       }
       g_free (meta);
@@ -1062,8 +1075,15 @@ overlay_try_metadata_decoder (EdgefirstOverlay *self)
    * after the (incorrect for Ara-2) reversal.
    *
    * Fix: swap protos from NHWC [1, H, W, C] to NCHW [1, C, H, W] to match
-   * the actual Ara-2 memory layout and the v2 schema's declared shape. */
+   * the actual Ara-2 memory layout and the v2 schema's declared shape.
+   *
+   * Gate: only apply when upstream framework is "ara2". TFLite reports
+   * dims innermost-first, so the reversal in parse_nnstreamer_dims() is
+   * correct and the resulting NHWC shape matches physical memory. */
+  gboolean is_ara2 = self->upstream_framework
+      && g_ascii_strcasecmp (self->upstream_framework, "ara2") == 0;
   gboolean corrected_native_dims = FALSE;
+  if (is_ara2) {
   for (gint i = 0; i < self->tensor_count; i++) {
     if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS
         && self->tensor_protos_is_nhwc[i]
@@ -1122,6 +1142,7 @@ overlay_try_metadata_decoder (EdgefirstOverlay *self)
       }
     }
   }
+  } /* is_ara2 */
 
   /* Compute model input size from (now-corrected) protos if not already set */
   if (self->model_width == 0 || self->model_height == 0) {
