@@ -1730,30 +1730,32 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
     return GST_FLOW_ERROR;
   }
 
-  /* ── Composite: background blit + masks (always) ──────────────── */
-  /* HAL >= 0.17.0 supports two rendering paths:
-   *   1. draw_proto_masks: GPU-accelerated, computes mask_coeff @ protos
-   *      at full output resolution with bilinear sampling → smooth masks.
-   *   2. draw_decoded_masks: takes pre-materialized 160×160 masks from CPU
-   *      materialization → upsampled by GPU → blockier but works for all models.
+  /* ── Draw overlay (background + boxes + masks) onto display_image ─ */
+  /* HAL's draw_decoded_masks / draw_proto_masks accept a `background`
+   * tensor that is GPU-blitted onto the framebuffer before compositing
+   * boxes and masks.  When background is NULL the GL backend clears to
+   * black — so we always pass src_img.
    *
-   * The proto path is used when proto_draw is available (seg models with v2
-   * schema). The decoded path is the fallback for detection-only models or
-   * when no proto_data was produced (legacy path, or before first tensor). */
+   * IMPORTANT: the tensor chain eagerly materializes masks (CPU, ~1 ms)
+   * so proto_snap is always NULL here and the video chain uses
+   * draw_decoded_masks (GL blit + boxes + masks, ~15 ms on Vivante).
+   * draw_proto_masks (GPU fused proto→mask matmul) is >2 s on Vivante
+   * because the fragment shader overwhelms the GC7000. */
   hal_detect_box_list    *boxes_hal = edgefirst_detect_box_list_get_hal (boxes_snap);
 
   guint64 t0_draw = _get_time_ns ();
   int draw_ret;
 
   if (proto_draw && boxes_hal) {
-    /* Fused GPU path: decode was done in tensor chain, rendering with
-     * full-resolution protos→mask matmul on GPU. */
+    /* Fused GPU path: proto matmul at full resolution on GPU.
+     * Only reached if eager materialization failed or was skipped. */
     draw_ret = hal_image_processor_draw_proto_masks (self->processor,
         display_image, boxes_hal, proto_draw, src_img, self->opacity,
         overlay_effective_letterbox (self),
         (enum hal_color_mode) self->color_mode);
   } else {
-    /* Legacy path: pre-materialized masks (or no masks at all) */
+    /* Pre-materialized masks (or detection-only).  This is the normal
+     * hot path — background blit + box rendering + mask blit via GL. */
     hal_segmentation_list *segs_hal = edgefirst_segmentation_list_get_hal (segs_snap);
     draw_ret = hal_image_processor_draw_decoded_masks (self->processor,
         display_image, boxes_hal, segs_hal, src_img, self->opacity,
@@ -1774,14 +1776,12 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   {
     g_mutex_lock (&self->lock);
     if (self->proto_snap) {
-      /* Tensor chain produced a newer proto while we were drawing — discard ours */
       hal_proto_data_free (proto_draw);
     } else {
-      /* No newer data — put ours back for the next video frame */
       self->proto_snap = proto_draw;
     }
     g_mutex_unlock (&self->lock);
-    proto_draw = NULL;  /* ownership transferred */
+    proto_draw = NULL;
   }
 
   if (src_owned)
@@ -1990,19 +1990,24 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
       (t1_decode - t0_decode) / 1e6, n_boxes,
       proto ? ", has protos" : "");
 
-  /* ── Store proto_data for fused GPU rendering in video chain ──── */
-  /* When proto_data is available, we store it directly for the video chain
-   * to use with draw_proto_masks() — the GPU-accelerated path that computes
-   * mask_coeff @ protos at full output resolution with bilinear sampling.
-   *
-   * Fallback: if no proto_data (detection-only model), we still need
-   * materialized segmentations for draw_decoded_masks(). */
+  /* ── Materialize masks on CPU (tensor chain) for video chain ──── */
+  /* Materialize 160×160 masks here (CPU, ~1-5 ms) so the video chain only
+   * needs draw_decoded_masks (GPU blit, ~20-40 ms).  The alternative —
+   * storing raw proto_data for draw_proto_masks — relies on the HAL's
+   * hybrid path (CPU materialize + GL draw) which on Vivante (imx8mp) can
+   * fall through to a pure-CPU draw_proto_masks fallback taking >2 seconds
+   * per frame.  By materializing eagerly we guarantee the fast GL-only
+   * draw_decoded_masks path is always used. */
   hal_segmentation_list *new_segs = NULL;
   if (proto) {
-    /* Fused path: keep proto_data alive for video chain */
-    GST_DEBUG_OBJECT (self, "storing proto_data for fused draw_proto_masks path");
-  } else {
-    /* Detection-only: no protos, no segs — boxes only */
+    guint64 t0_mat = _get_time_ns ();
+    new_segs = hal_image_processor_materialize_masks (self->processor,
+        new_boxes, proto, overlay_effective_letterbox (self));
+    guint64 t1_mat = _get_time_ns ();
+    GST_INFO_OBJECT (self, "materialize_masks: %.1f ms (%s)",
+        (t1_mat - t0_mat) / 1e6, new_segs ? "ok" : "none");
+    hal_proto_data_free (proto);
+    proto = NULL;
   }
 
   /* ── Wrap in GObjects (for signal + legacy segs_obj) ──────────── */
@@ -2020,11 +2025,9 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   self->boxes_obj = g_object_ref (boxes_obj);
   self->segs_obj  = segs_obj ? g_object_ref (segs_obj) : NULL;
 
-  /* Store raw HAL proto_data for fused video-chain rendering.
-   * The video chain will use draw_proto_masks() when proto_snap is set,
-   * falling back to draw_decoded_masks() when proto_snap is NULL. */
-  if (self->proto_snap) hal_proto_data_free (self->proto_snap);
-  self->proto_snap = proto;         /* transfer ownership */
+  /* Proto was consumed above by materialize_masks; proto_snap stays NULL
+   * so the video chain always takes the draw_decoded_masks path. */
+  if (self->proto_snap) { hal_proto_data_free (self->proto_snap); self->proto_snap = NULL; }
 
   if (GST_BUFFER_PTS (buf) != GST_CLOCK_TIME_NONE)
     self->decode_ts = GST_BUFFER_PTS (buf);
