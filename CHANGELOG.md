@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-04-26
+
+### Fixed
+
+- **Vivante proto mask regression** — the fused GPU proto→mask matmul path
+  (`draw_proto_masks`) runs a 32-wide dot product per-pixel in a fragment shader,
+  catastrophically slow on Vivante GC7000 (>2200 ms/frame). Now eagerly
+  materializes masks on CPU in the tensor chain (~1–5 ms) so the video chain
+  always uses `draw_decoded_masks` (GL blit + boxes + mask overlay, ~15–40 ms).
+  Ara-2 segmentation on i.MX 8M Plus went from <1 FPS to 21+ FPS.
+- **Double-divided Ara-2 box coordinates** — the `new-detection` signal's box
+  list was dividing pixel-space coordinates by model input size twice. Now queries
+  `hal_decoder_normalized_boxes()` for ground truth after decoder creation.
+- **Camera-as-background** — passes the camera buffer as background instead of the
+  pre-convert buffer that HAL 0.16.4+ erases, fixing black background regression.
+  Also bumps canvas pool to triple-buffered.
+
+### Added
+
+- **Model-metadata decoder path** — creates the HAL decoder from upstream
+  `model-metadata` JSON (edgefirst.json v2 schema) when available, eliminating
+  auto-config heuristics. Falls back to auto-config when no metadata is found.
+- **Framework-aware dimension handling** — queries upstream `tensor_filter`
+  framework property to correctly interpret dimension ordering for both TFLite
+  (innermost-first NHWC) and Ara-2 (native C-contiguous) without workarounds.
+
+### Removed
+
+- **Ara-2 dimension correction workarounds** — with the Ara-2 tensor_filter now
+  correctly reporting dimensions in innermost-first order (nnstreamer fix
+  925d9ba3), the overlay's NCHW/NHWC shape correction blocks and framework
+  detection are no longer needed. Both backends handled uniformly through the
+  standard auto-config pipeline.
+
+### Known Issues
+
+- Removed from 0.3.0: TFLite NHWC proto stripe artifacts are fixed by the
+  decoded masks path (CPU materialization bypasses the layout mismatch).
+
 ## [0.3.0] - 2026-04-16
 
 ### Fixed
