@@ -953,6 +953,76 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
   self->has_split_boxes = has_split_boxes;
   self->has_protos = has_protos;
 
+  /* Infer model input size from tensor shapes so overlay_effective_letterbox
+   * can compute an aspect-preserving un-letterbox even in the schema-driven
+   * path (where overlay_create_decoder — the other place model_width is set —
+   * never runs because the decoder is built from JSON at start time).
+   *
+   * For YOLOv8-family models the FPN tensors are at strides 8 / 16 / 32
+   * (so spatial dims 80 / 40 / 20 for a 640×640 model). The finest level
+   * appears in MULTIPLE outputs (boxes + scores + optional mask coeffs all
+   * share the same spatial dim), while a proto tensor (segmentation only,
+   * stride 4) is a single tensor with a strictly LARGER spatial dim than
+   * any per-scale tensor.
+   *
+   * Algorithm:
+   *   - Tally how many 4-D tensors carry each distinct spatial dim.
+   *   - The finest per-scale spatial is the LARGEST dim with count >= 2.
+   *   - If a single-instance dim exists that is strictly larger, it's a
+   *     proto tensor — use its dim × 4 (proto stride).
+   *   - Otherwise use finest_per_scale × 8.
+   *
+   * Both rules yield 640 for a 640×640 YOLOv8/-seg model. The
+   * `model-width` / `model-height` properties override this when set. */
+  if (self->model_width == 0 || self->model_height == 0) {
+    /* Collect (spatial, count) pairs. Small fixed-size table is enough — a
+     * YOLOv8 model has 3-4 distinct spatial dims. */
+    size_t spatials[16] = {0};
+    int    counts[16]   = {0};
+    int    n_spatials   = 0;
+    for (gint i = 0; i < self->tensor_count; i++) {
+      if (self->hal_ndims[i] != 4) continue;
+      size_t a = self->hal_shapes[i][1];
+      size_t b = self->hal_shapes[i][2];
+      size_t s = a > b ? a : b;
+      if (s == 0) continue;
+      int found = 0;
+      for (int k = 0; k < n_spatials; k++) {
+        if (spatials[k] == s) { counts[k]++; found = 1; break; }
+      }
+      if (!found && n_spatials < 16) {
+        spatials[n_spatials] = s;
+        counts[n_spatials]   = 1;
+        n_spatials++;
+      }
+    }
+
+    /* Largest spatial that appears in ≥2 outputs = finest per-scale level. */
+    size_t finest_ps = 0;
+    for (int k = 0; k < n_spatials; k++) {
+      if (counts[k] >= 2 && spatials[k] > finest_ps) finest_ps = spatials[k];
+    }
+    /* Strictly larger single-instance spatial = proto tensor. */
+    size_t proto_spatial = 0;
+    for (int k = 0; k < n_spatials; k++) {
+      if (counts[k] == 1 && spatials[k] > finest_ps && spatials[k] > proto_spatial)
+        proto_spatial = spatials[k];
+    }
+
+    guint inferred = 0;
+    if (proto_spatial > 0)      inferred = (guint) proto_spatial * 4;
+    else if (finest_ps > 0)     inferred = (guint) finest_ps     * 8;
+
+    if (inferred > 0) {
+      if (self->model_width == 0)  self->model_width  = inferred;
+      if (self->model_height == 0) self->model_height = inferred;
+      GST_INFO_OBJECT (self,
+          "inferred model input size %u (finest_ps=%zu proto=%zu) "
+          "used for letterbox un-correction",
+          inferred, finest_ps, proto_spatial);
+    }
+  }
+
   g_strfreev (dim_parts);
   g_strfreev (type_parts);
 
@@ -1606,9 +1676,15 @@ edgefirst_overlay_tensors_event (GstPad *pad G_GNUC_UNUSED,
     case GST_EVENT_CAPS: {
       GstCaps *caps;
       gst_event_parse_caps (event, &caps);
-      /* Parse tensor shapes from caps; decoder creation deferred to
-       * first buffer where quant meta is available. */
-      if (!self->caps_parsed && !self->decoder)
+      /* Always parse tensor shapes from CAPS so the tensors chain can wrap
+       * each GstMemory with the correct HAL shape. When `model-config` is
+       * supplied, the decoder is already built from the schema in
+       * overlay_start(), but the chain still needs hal_shapes[]/hal_ndims[]
+       * populated — otherwise it falls back to a 1-D byte-size shape that
+       * the schema-driven per-scale decoder can never match (HAL emits
+       * `InvalidShape: per-scale boxes (level 0): no remaining tensor
+       * matches [1, H, W, C]`). */
+      if (!self->caps_parsed)
         overlay_parse_tensor_caps (self, caps);
       gst_event_unref (event);
       return TRUE;
@@ -1928,6 +2004,14 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   hal_tensor **outputs = g_new0 (hal_tensor *, n_mem);
   gboolean ok = TRUE;
 
+#if HAVE_NNSTREAMER
+  /* Per-tensor quant metadata (scale, zero-point) attached upstream by
+   * tensor_filter. Required by the schema-driven per-scale decoder, which
+   * reads quantization live from each bound HAL tensor; without this the
+   * decoder fails with QuantMissing on every integer output. */
+  GstNnsTensorQuantMeta *qm = gst_buffer_get_nns_tensor_quant_meta (buf);
+#endif
+
   for (guint i = 0; i < n_mem; i++) {
     GstMemory *mem = gst_buffer_peek_memory (buf, i);
 
@@ -1955,6 +2039,28 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
       ok = FALSE;
       break;
     }
+
+#if HAVE_NNSTREAMER
+    /* Attach per-tensor affine quantization for integer outputs. The
+     * auto-config (no model-config) path attaches quant via
+     * hal_decoder_params_output_set_quantization during decoder build;
+     * the schema-driven path builds the decoder before any buffer is
+     * seen and instead reads quant live from each tensor, so we attach
+     * it here for every frame. Skip float tensors (set_quantization
+     * rejects them with EINVAL). */
+    if (qm && i < qm->num_tensors && dtype != HAL_DTYPE_F32) {
+      const NnsTensorQuantInfo *qi = &qm->quant[i];
+      if (qi->scheme != NNS_QUANT_NONE && qi->num_params > 0) {
+        float scale = (float) qi->scales[0];
+        int   zp    = (int)   qi->zero_points[0];
+        if (hal_tensor_set_quantization (outputs[i], scale, zp) != 0) {
+          GST_WARNING_OBJECT (self,
+              "hal_tensor_set_quantization[%u] failed (scale=%g zp=%d): %s",
+              i, scale, zp, strerror (errno));
+        }
+      }
+    }
+#endif
   }
 
   if (!ok) {
