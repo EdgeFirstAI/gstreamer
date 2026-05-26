@@ -608,10 +608,36 @@ overlay_start (EdgefirstOverlay *self)
       self->processor = NULL;
       return FALSE;
     }
-    /* model-config provides normalized flag; property override takes precedence */
-    if (self->normalized_prop == OVERLAY_NORMALIZED_AUTO)
-      self->normalized = hal_decoder_normalized_boxes (self->decoder);
-    else
+    /* model-config provides normalized flag; property override takes precedence.
+     *
+     * HAL contract subtlety (HAL ≤ 0.24.0): the per-scale decoder always
+     * pre-normalizes box coords to [0,1] when the schema declares an
+     * `input.shape` (`hal_decoder_input_dims()` returns success), but
+     * `hal_decoder_normalized_boxes()` still reports the schema's static
+     * annotation — which is `Some(false)` for per-scale schemas because the
+     * raw `(grid + dist) * stride` math is pixel-space before HAL's
+     * internal `maybe_normalize_boxes_in_place` runs.
+     *
+     * Result: relying on `normalized_boxes()` alone causes the gst bridge
+     * to divide already-normalized coords by `model_w/h`, collapsing every
+     * detection to ~0. Detect the per-scale + input_dims case by querying
+     * `input_dims` and trust HAL's internal normalization. */
+    if (self->normalized_prop == OVERLAY_NORMALIZED_AUTO) {
+      gint raw = hal_decoder_normalized_boxes (self->decoder);
+      size_t dim_w = 0, dim_h = 0;
+      gboolean has_input_dims =
+          (hal_decoder_input_dims (self->decoder, &dim_w, &dim_h) == 1
+           && dim_w > 0 && dim_h > 0);
+      if (raw == 0 && has_input_dims) {
+        self->normalized = TRUE;
+        GST_INFO_OBJECT (self,
+            "schema-driven decoder: hal reports normalized=0 but input_dims="
+            "%zux%zu (per-scale path normalizes internally) — treating as normalized",
+            dim_w, dim_h);
+      } else {
+        self->normalized = raw;
+      }
+    } else
       self->normalized = (self->normalized_prop == OVERLAY_NORMALIZED_TRUE);
   } else {
     self->decoder   = NULL;   /* deferred: auto-configure on tensors CAPS */
