@@ -57,6 +57,7 @@ enum {
   PROP_CLASS_COLORS,
   PROP_COMPUTE,
   PROP_NORMALIZED,
+  PROP_EXPOSE_TIMING,
 };
 
 /* Tri-state for normalized box coordinates */
@@ -120,6 +121,7 @@ static const enum hal_compute_backend overlay_compute_map[] = {
 
 enum {
   SIGNAL_NEW_DETECTION,
+  SIGNAL_FRAME_TIMING,
   N_SIGNALS,
 };
 static guint signals[N_SIGNALS];
@@ -206,6 +208,15 @@ struct _EdgefirstOverlay {
   gchar     *class_colors;
   OverlayCompute compute;
   OverlayNormalized normalized_prop;  /* user-facing tri-state property */
+
+  /* Per-frame timing exposure (opt-in via expose-timing property).
+   * Tensors_chain stores the most recent decode + materialize times here;
+   * video_chain emits the frame-timing signal after the draw, carrying
+   * (decode_ms, materialize_ms, draw_ms) for the just-completed frame.
+   * Atomic doubles to avoid lock contention with the NN thread. */
+  gboolean   expose_timing;
+  gdouble    last_decode_ms;
+  gdouble    last_materialize_ms;
 };
 
 /* ── Pad templates ───────────────────────────────────────────────── */
@@ -341,6 +352,13 @@ edgefirst_overlay_class_init (EdgefirstOverlayClass *klass)
           OVERLAY_NORMALIZED_AUTO,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (obj_class, PROP_EXPOSE_TIMING,
+      g_param_spec_boolean ("expose-timing", "Expose per-frame timing",
+          "Emit a per-frame timing signal with decode, materialize, and draw "
+          "millisecond measurements taken inside the element. Off by default; "
+          "applications opt in for instrumentation.",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* new-detection signal */
   signals[SIGNAL_NEW_DETECTION] = g_signal_new ("new-detection",
       G_TYPE_FROM_CLASS (klass),
@@ -349,6 +367,18 @@ edgefirst_overlay_class_init (EdgefirstOverlayClass *klass)
       G_TYPE_NONE, 2,
       EDGEFIRST_TYPE_DETECT_BOX_LIST,
       EDGEFIRST_TYPE_SEGMENTATION_LIST);
+
+  /* frame-timing signal: emitted once per video chain completion when the
+   * expose-timing property is TRUE. Carries (decode_ms, materialize_ms,
+   * draw_ms) for the just-completed frame. Application connects and
+   * accumulates / reports as desired. Materialize_ms is 0 for detection-only
+   * models (no proto path). */
+  signals[SIGNAL_FRAME_TIMING] = g_signal_new ("frame-timing",
+      G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST,
+      0, NULL, NULL, NULL,
+      G_TYPE_NONE, 3,
+      G_TYPE_DOUBLE, G_TYPE_DOUBLE, G_TYPE_DOUBLE);
 
   gst_element_class_set_static_metadata (el_class,
       "EdgeFirst Overlay", "Filter/Video",
@@ -387,6 +417,9 @@ edgefirst_overlay_init (EdgefirstOverlay *self)
   self->color_mode            = EDGEFIRST_COLOR_MODE_CLASS;
   self->decode_ts             = GST_CLOCK_TIME_NONE;
   self->dmabuf_allocator      = gst_dmabuf_allocator_new ();
+  self->expose_timing         = FALSE;
+  self->last_decode_ms        = 0.0;
+  self->last_materialize_ms   = 0.0;
 }
 
 /* ── finalize, set_property, get_property ────────────────────────── */
@@ -473,6 +506,9 @@ edgefirst_overlay_set_property (GObject *object, guint prop_id,
     case PROP_NORMALIZED:
       self->normalized_prop = (OverlayNormalized) g_value_get_enum (value);
       break;
+    case PROP_EXPOSE_TIMING:
+      self->expose_timing = g_value_get_boolean (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
@@ -499,6 +535,7 @@ edgefirst_overlay_get_property (GObject *object, guint prop_id,
     case PROP_CLASS_COLORS:       g_value_set_string  (value, self->class_colors);        break;
     case PROP_COMPUTE:            g_value_set_enum    (value, (gint) self->compute);      break;
     case PROP_NORMALIZED:         g_value_set_enum    (value, (gint) self->normalized_prop); break;
+    case PROP_EXPOSE_TIMING:      g_value_set_boolean (value, self->expose_timing);          break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec); break;
   }
 }
@@ -1872,6 +1909,16 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
       (t1_draw - t0_draw) / 1e6,
       boxes_hal ? "yes" : "no", proto_draw ? "yes" : "no", draw_ret);
 
+  /* Emit per-frame timing signal when instrumentation is enabled.
+   * Carries the most recent decode + materialize ms (set by tensors_chain
+   * each time a new tensor batch is decoded) and the just-measured draw_ms.
+   * Detection-only models report materialize_ms = 0. */
+  if (G_UNLIKELY (self->expose_timing)) {
+    gdouble draw_ms = (gdouble) (t1_draw - t0_draw) / 1e6;
+    g_signal_emit (self, signals[SIGNAL_FRAME_TIMING], 0,
+        self->last_decode_ms, self->last_materialize_ms, draw_ms);
+  }
+
   /* Return proto_draw to storage for reuse on subsequent video frames.
    * The tensor chain may have already stored a newer proto_snap — if so,
    * free the stale one we just used. */
@@ -2122,6 +2169,11 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
       (t1_decode - t0_decode) / 1e6, n_boxes,
       proto ? ", has protos" : "");
 
+  /* Cache decode timing for the frame-timing signal emitted in video_chain.
+   * Reset materialize to 0 so detection-only models report 0 there. */
+  self->last_decode_ms      = (t1_decode - t0_decode) / 1e6;
+  self->last_materialize_ms = 0.0;
+
   /* ── Materialize masks on CPU (tensor chain) for video chain ──── */
   /* Materialize 160×160 masks here (CPU, ~1-5 ms) so the video chain only
    * needs draw_decoded_masks (GPU blit, ~20-40 ms).  The alternative —
@@ -2138,6 +2190,7 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
     guint64 t1_mat = _get_time_ns ();
     GST_INFO_OBJECT (self, "materialize_masks: %.1f ms (%s)",
         (t1_mat - t0_mat) / 1e6, new_segs ? "ok" : "none");
+    self->last_materialize_ms = (t1_mat - t0_mat) / 1e6;
     hal_proto_data_free (proto);
     proto = NULL;
   }
