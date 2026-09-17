@@ -177,3 +177,5 @@ See `examples/` for more detailed pipeline scripts with comments.
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).
+
+<img referrerpolicy="no-referrer-when-downgrade" src="https://px.edgefirst.ai/a.png?x-pxid=d1fa4def-39a7-44ee-bd3f-82fc995fc547" alt="" width="1" height="1" style="position:absolute; width:1px; height:1px; opacity:0; pointer-events:none;" />
