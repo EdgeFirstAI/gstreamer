@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING: built on the modular EdgeFirst HAL C API (>= 0.34.1).** The
+  HAL plugin links `edgefirst-image` and `edgefirst-decoder`, and the core
+  library takes its detection types from the header-only
+  `edgefirst-decoder-abi`, all found through pkg-config. The monolithic
+  `edgefirst-hal` library and its `edgefirst/hal.h` header are no longer
+  used; pixel formats, dtypes and storage kinds now come from HAL's shared
+  vocabulary (`EF_DTYPE_*`, `EF_STORAGE_KIND_*`, pixel format wire names).
+- **BREAKING: detection types in `edgefirstdetection.h` wrap HAL C structs.**
+  `edgefirst_detect_box_list_new()` and `_new_normalized()` take an
+  `ef_detect_box` array and count and copy it;
+  `edgefirst_segmentation_list_new()` takes an `ef_segmentation` array, a
+  count, and an owner released when the list is finalized. The
+  `_get_hal()` accessors are replaced by `edgefirst_detect_box_list_get_data()`
+  and `edgefirst_segmentation_list_get_data()`. `edgefirst-gstreamer-1.0.pc`
+  requires `edgefirst-decoder-abi`.
+- GStreamer video formats map to HAL pixel formats through one table,
+  which also decides the input formats `edgefirstcameraadaptor` advertises.
+- `edgefirstcameraadaptor` letterboxes with HAL's own letterbox for the
+  centred placement. A placement moved by the `letterbox-top/bottom/left/right`
+  overrides is converted into a view of the output, staged through a packed
+  image for planar (CHW) outputs, with the padding filled once per output
+  buffer.
+- The memcpy fallback for system-memory input honours the row stride of the
+  HAL image it copies into.
+- With HAL 0.34.1, RGB to greyscale uses BT.601 weights and YUV input
+  conversion follows HAL's current colorimetry defaults, so `gray` and
+  NV12/YUY2 outputs differ from those produced with HAL 0.24.
+- `env.sh` downloads the EdgeFirst HAL 0.34.1 C library archive.
+
+### Removed
+
+- The unused fused proto draw path in `edgefirstoverlay`; masks are always
+  materialized in the tensor chain and drawn with `draw_decoded_masks`.
+
 ## [0.4.0] - 2026-04-26
 
 ### Fixed

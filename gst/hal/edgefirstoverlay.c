@@ -3,8 +3,8 @@
  * Copyright (C) 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * Dual-sink GstElement: accepts video + other/tensors, runs HAL >= 0.17.0
- * decode->draw_proto_masks (GPU fused) pipeline, emits new-detection signal.
+ * Dual-sink GstElement: accepts video + other/tensors, runs the HAL
+ * decode -> materialize masks -> draw pipeline, emits new-detection signal.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -15,7 +15,8 @@
 
 #include <gst/video/video.h>
 #include <gst/allocators/gstdmabuf.h>
-#include <edgefirst/hal.h>
+#include <edgefirst/decoder.h>
+#include "edgefirsthalutils.h"
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -25,8 +26,6 @@
 #if HAVE_NNSTREAMER
 #include <nnstreamer_tensor_quant_meta.h>
 #endif
-
-/* HAL >= 0.16.3 is a hard dependency — all APIs below are always available. */
 
 GST_DEBUG_CATEGORY_STATIC (edgefirst_overlay_debug);
 #define GST_CAT_DEFAULT edgefirst_overlay_debug
@@ -110,11 +109,11 @@ overlay_compute_get_type (void)
   return type;
 }
 
-static const enum hal_compute_backend overlay_compute_map[] = {
-  [OVERLAY_COMPUTE_AUTO]   = HAL_COMPUTE_BACKEND_AUTO,
-  [OVERLAY_COMPUTE_OPENGL] = HAL_COMPUTE_BACKEND_OPENGL,
-  [OVERLAY_COMPUTE_G2D]    = HAL_COMPUTE_BACKEND_G2D,
-  [OVERLAY_COMPUTE_CPU]    = HAL_COMPUTE_BACKEND_CPU,
+static const uint32_t overlay_compute_map[] = {
+  [OVERLAY_COMPUTE_AUTO]   = EDGEFIRST_HAL_BACKEND_AUTO,
+  [OVERLAY_COMPUTE_OPENGL] = EDGEFIRST_HAL_BACKEND_OPENGL,
+  [OVERLAY_COMPUTE_G2D]    = EDGEFIRST_HAL_BACKEND_G2D,
+  [OVERLAY_COMPUTE_CPU]    = EDGEFIRST_HAL_BACKEND_CPU,
 };
 
 /* ── Signal IDs ──────────────────────────────────────────────────── */
@@ -137,9 +136,9 @@ struct _EdgefirstOverlay {
   GstPad *srcpad;
 
   /* HAL state */
-  hal_image_processor   *processor;
-  hal_decoder           *decoder;
-  hal_tensor            *display_images[3]; /* triple-buffered RGBA render targets */
+  ef_image_processor    *processor;
+  ef_decoder            *decoder;
+  ef_tensor             *display_images[3]; /* triple-buffered RGBA render targets */
   guint                  display_buf_idx;   /* index of buffer to render into this frame */
   gboolean               display_is_dmabuf;
   GstAllocator          *dmabuf_allocator;
@@ -147,13 +146,13 @@ struct _EdgefirstOverlay {
   /* Inode-keyed cache of imported camera-frame HAL tensors. Each upstream
    * dmabuf-fd pool reuses the same physical buffer across frames; caching
    * by inode lets HAL keep the EGLImage handle warm and amortizes
-   * hal_import_image cost. Cache owns the tensors; freed in overlay_stop. */
+   * the import cost. Cache owns the tensors; freed in overlay_stop. */
   GHashTable            *frame_tensor_cache;
 
   /* Video info */
   GstVideoInfo           in_info;
   gboolean               in_info_valid;
-  enum hal_pixel_format  src_pixel_format;
+  const EdgefirstHalFormat *src_pixel_format;
   guint                  display_w, display_h;
 
   /* Thread-safe decoded state */
@@ -161,11 +160,6 @@ struct _EdgefirstOverlay {
   GCond                  decode_cond;
   EdgeFirstDetectBoxList    *boxes_obj;       /* NULL until first tensor */
   EdgeFirstSegmentationList *segs_obj;        /* NULL for det-only models */
-  /* Fused proto path: stored from tensor chain, consumed in video chain.
-   * When proto_snap is non-NULL, draw_proto_masks is used (GPU-accelerated
-   * full-res rendering). When NULL, falls back to draw_decoded_masks with
-   * pre-materialized segs_obj (low-res 160×160 upsampled). */
-  struct hal_proto_data  *proto_snap;         /* owned, NULL if det-only */
   GstClockTime           decode_ts;
   gboolean               flushing;
   gboolean               normalized;         /* TRUE if decoder outputs [0,1] coords */
@@ -178,14 +172,14 @@ struct _EdgefirstOverlay {
   size_t   tensor_shapes[16][8];
   size_t   hal_ndims[16];
   size_t   hal_shapes[16][8];
-  enum HalOutputType tensor_types[16];
+  uint32_t tensor_types[16];   /* HAL decoder output type codes */
   /* For protos tensors, remember the physical memory layout so
    * overlay_create_decoder can label the axes correctly. HAL's
    * swap_axes_if_needed then reorders to canonical NHWC without
    * touching the byte stream. */
   gboolean tensor_protos_is_nhwc[16];
   gint     tensor_count;
-  enum hal_dtype tensor_dtypes[16];
+  uint32_t tensor_dtypes[16];  /* HAL dtype codes */
   gboolean caps_parsed;           /* TRUE after tensors CAPS event parsed */
   gboolean has_split_boxes;
   gboolean has_protos;
@@ -438,7 +432,6 @@ edgefirst_overlay_finalize (GObject *object)
   /* HAL and GObjects freed in stop(); clear in case finalize is called early */
   g_clear_object (&self->boxes_obj);
   g_clear_object (&self->segs_obj);
-  if (self->proto_snap) { hal_proto_data_free (self->proto_snap); self->proto_snap = NULL; }
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -542,19 +535,30 @@ edgefirst_overlay_get_property (GObject *object, guint prop_id,
 
 /* ── start / stop ────────────────────────────────────────────────── */
 
-/* Map "yolov8" string property to HalDecoderVersion enum */
-static enum HalDecoderVersion
+/* Map the "yolov8" style string property to a HAL decoder version code */
+static uint32_t
 parse_decoder_version (const gchar *str)
 {
   if (!str || g_ascii_strcasecmp (str, "yolov8") == 0)
-    return HAL_DECODER_VERSION_YOLOV8;
+    return EDGEFIRST_HAL_DECODER_YOLOV8;
   if (g_ascii_strcasecmp (str, "yolo11") == 0)
-    return HAL_DECODER_VERSION_YOLO11;
+    return EDGEFIRST_HAL_DECODER_YOLO11;
   if (g_ascii_strcasecmp (str, "yolov5") == 0)
-    return HAL_DECODER_VERSION_YOLOV5;
+    return EDGEFIRST_HAL_DECODER_YOLOV5;
   if (g_ascii_strcasecmp (str, "yolo26") == 0)
-    return HAL_DECODER_VERSION_YOLO26;
-  return HAL_DECODER_VERSION_YOLOV8;
+    return EDGEFIRST_HAL_DECODER_YOLO26;
+  return EDGEFIRST_HAL_DECODER_YOLOV8;
+}
+
+static uint32_t
+color_mode_to_hal (EdgeFirstColorMode mode)
+{
+  switch (mode) {
+    case EDGEFIRST_COLOR_MODE_INSTANCE: return EDGEFIRST_HAL_COLOR_MODE_INSTANCE;
+    case EDGEFIRST_COLOR_MODE_TRACK:    return EDGEFIRST_HAL_COLOR_MODE_TRACK;
+    case EDGEFIRST_COLOR_MODE_CLASS:
+    default:                            return EDGEFIRST_HAL_COLOR_MODE_CLASS;
+  }
 }
 
 /* Return the letterbox rect to pass to HAL mask operations.
@@ -593,28 +597,14 @@ overlay_effective_letterbox (EdgefirstOverlay *self)
   return self->auto_letterbox;
 }
 
-/* Map GstVideoFormat to HAL pixel format */
-static enum hal_pixel_format
-gst_format_to_hal (GstVideoFormat fmt)
-{
-  switch (fmt) {
-    case GST_VIDEO_FORMAT_NV12:  return HAL_PIXEL_FORMAT_NV12;
-    case GST_VIDEO_FORMAT_YUY2:  return HAL_PIXEL_FORMAT_YUYV;
-    case GST_VIDEO_FORMAT_RGB:   return HAL_PIXEL_FORMAT_RGB;
-    case GST_VIDEO_FORMAT_RGBA:  return HAL_PIXEL_FORMAT_RGBA;
-    case GST_VIDEO_FORMAT_GRAY8: return HAL_PIXEL_FORMAT_GREY;
-    default:                     return HAL_PIXEL_FORMAT_RGB;
-  }
-}
-
 static gboolean
 overlay_start (EdgefirstOverlay *self)
 {
-  enum hal_compute_backend backend = overlay_compute_map[self->compute];
-  if (backend == HAL_COMPUTE_BACKEND_AUTO)
-    self->processor = hal_image_processor_new ();
+  uint32_t backend = overlay_compute_map[self->compute];
+  if (backend == EDGEFIRST_HAL_BACKEND_AUTO)
+    self->processor = ef_image_processor_new ();
   else
-    self->processor = hal_image_processor_new_with_backend (backend);
+    self->processor = ef_image_processor_new_with_backend (backend);
   if (!self->processor) {
     GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
         ("Failed to create HAL image processor: %s", strerror (errno)), (NULL));
@@ -626,31 +616,31 @@ overlay_start (EdgefirstOverlay *self)
       self->compute == OVERLAY_COMPUTE_G2D ? "g2d" : "cpu");
 
   if (self->model_config) {
-    struct hal_decoder_params *params = hal_decoder_params_new ();
+    ef_decoder_params *params = ef_decoder_params_new ();
     if (g_file_test (self->model_config, G_FILE_TEST_EXISTS))
-      hal_decoder_params_set_config_file (params, self->model_config);
+      ef_decoder_params_set_config_file (params, self->model_config);
     else
-      hal_decoder_params_set_config_json (params, self->model_config, 0);
-    hal_decoder_params_set_score_threshold (params, self->score_threshold);
-    hal_decoder_params_set_iou_threshold (params, self->iou_threshold);
+      ef_decoder_params_set_config_json (params, self->model_config, 0);
+    ef_decoder_params_set_score_threshold (params, self->score_threshold);
+    ef_decoder_params_set_iou_threshold (params, self->iou_threshold);
 
-    self->decoder = hal_decoder_new (params);
-    hal_decoder_params_free (params);
+    self->decoder = ef_decoder_new (params);
+    ef_decoder_params_free (params);
 
     if (!self->decoder) {
       GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
           ("Failed to create HAL decoder from config \"%s\": %s",
            self->model_config, strerror (errno)), (NULL));
-      hal_image_processor_free (self->processor);
+      ef_image_processor_free (self->processor);
       self->processor = NULL;
       return FALSE;
     }
     /* model-config provides normalized flag; property override takes precedence.
      *
-     * HAL contract subtlety (HAL ≤ 0.24.0): the per-scale decoder always
+     * HAL contract subtlety: the per-scale decoder always
      * pre-normalizes box coords to [0,1] when the schema declares an
-     * `input.shape` (`hal_decoder_input_dims()` returns success), but
-     * `hal_decoder_normalized_boxes()` still reports the schema's static
+     * `input.shape` (`ef_decoder_input_dims()` returns success), but
+     * `ef_decoder_normalized_boxes()` may still report the schema's static
      * annotation — which is `Some(false)` for per-scale schemas because the
      * raw `(grid + dist) * stride` math is pixel-space before HAL's
      * internal `maybe_normalize_boxes_in_place` runs.
@@ -660,17 +650,18 @@ overlay_start (EdgefirstOverlay *self)
      * detection to ~0. Detect the per-scale + input_dims case by querying
      * `input_dims` and trust HAL's internal normalization. */
     if (self->normalized_prop == OVERLAY_NORMALIZED_AUTO) {
-      gint raw = hal_decoder_normalized_boxes (self->decoder);
-      size_t dim_w = 0, dim_h = 0;
+      gint raw = ef_decoder_normalized_boxes (self->decoder);
+      uintptr_t dim_w = 0;
+      uintptr_t dim_h = 0;
       gboolean has_input_dims =
-          (hal_decoder_input_dims (self->decoder, &dim_w, &dim_h) == 1
+          (ef_decoder_input_dims (self->decoder, &dim_w, &dim_h) == 0
            && dim_w > 0 && dim_h > 0);
       if (raw == 0 && has_input_dims) {
         self->normalized = TRUE;
         GST_INFO_OBJECT (self,
             "schema-driven decoder: hal reports normalized=0 but input_dims="
             "%zux%zu (per-scale path normalizes internally) — treating as normalized",
-            dim_w, dim_h);
+            (size_t) dim_w, (size_t) dim_h);
       } else {
         self->normalized = raw;
       }
@@ -688,11 +679,11 @@ overlay_start (EdgefirstOverlay *self)
   self->decode_ts = GST_CLOCK_TIME_NONE;
 
   /* Inode-keyed cache for camera-frame imports. Key is heap-allocated
-   * guint64 (the dmabuf inode), value is the borrowed hal_tensor. The
+   * guint64 (the dmabuf inode), value is the borrowed ef_tensor. The
    * cache owns both — destroyed in overlay_stop. */
   self->frame_tensor_cache = g_hash_table_new_full (
       g_int64_hash, g_int64_equal,
-      g_free, (GDestroyNotify) hal_tensor_free);
+      g_free, (GDestroyNotify) ef_tensor_free);
 
   return TRUE;
 }
@@ -705,7 +696,7 @@ overlay_stop (EdgefirstOverlay *self)
   g_cond_broadcast (&self->decode_cond);
   g_mutex_unlock (&self->lock);
 
-  hal_decoder_free (self->decoder);
+  ef_decoder_free (self->decoder);
   self->decoder = NULL;
   self->tensor_count = 0;
 
@@ -716,18 +707,17 @@ overlay_stop (EdgefirstOverlay *self)
     self->frame_tensor_cache = NULL;
   }
 
-  hal_image_processor_free (self->processor);
+  ef_image_processor_free (self->processor);
   self->processor = NULL;
 
   for (int i = 0; i < 3; i++) {
-    hal_tensor_free (self->display_images[i]);
+    ef_tensor_free (self->display_images[i]);
     self->display_images[i] = NULL;
   }
 
   g_mutex_lock (&self->lock);
   g_clear_object (&self->boxes_obj);
   g_clear_object (&self->segs_obj);
-  if (self->proto_snap) { hal_proto_data_free (self->proto_snap); self->proto_snap = NULL; }
   g_mutex_unlock (&self->lock);
 
   g_mutex_clear (&self->lock);
@@ -765,16 +755,16 @@ edgefirst_overlay_change_state (GstElement *element, GstStateChange transition)
 /* ── auto_config_decoder (tensors CAPS handler helper) ───────────── */
 
 /* Parse NNStreamer tensor dtype string to HAL dtype */
-static enum hal_dtype
+static uint32_t
 nnstreamer_type_to_hal (const gchar *type_str)
 {
-  if (!type_str) return HAL_DTYPE_F32;
-  if (g_strcmp0 (type_str, "float32") == 0) return HAL_DTYPE_F32;
-  if (g_strcmp0 (type_str, "uint8")   == 0) return HAL_DTYPE_U8;
-  if (g_strcmp0 (type_str, "int8")    == 0) return HAL_DTYPE_I8;
-  if (g_strcmp0 (type_str, "int16")   == 0) return HAL_DTYPE_I16;
-  if (g_strcmp0 (type_str, "int32")   == 0) return HAL_DTYPE_I32;
-  return HAL_DTYPE_F32;
+  if (!type_str) return EF_DTYPE_F32;
+  if (g_strcmp0 (type_str, "float32") == 0) return EF_DTYPE_F32;
+  if (g_strcmp0 (type_str, "uint8")   == 0) return EF_DTYPE_U8;
+  if (g_strcmp0 (type_str, "int8")    == 0) return EF_DTYPE_I8;
+  if (g_strcmp0 (type_str, "int16")   == 0) return EF_DTYPE_I16;
+  if (g_strcmp0 (type_str, "int32")   == 0) return EF_DTYPE_I32;
+  return EF_DTYPE_F32;
 }
 
 /* Parse NNStreamer dim string "C:W:H:B" (innermost first) to shape[] (row-major).
@@ -893,15 +883,15 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
   /* ── Pass 2: compute HAL-convention shapes and output types ──── */
   /* Track per-tensor output type for quant application later */
 
-  static const char *type_names[HAL_OUTPUT_TYPE_CLASSES + 1] = {
-    [HAL_OUTPUT_TYPE_DETECTION]         = "DETECTION",
-    [HAL_OUTPUT_TYPE_BOXES]             = "BOXES",
-    [HAL_OUTPUT_TYPE_SCORES]            = "SCORES",
-    [HAL_OUTPUT_TYPE_PROTOS]            = "PROTOS",
-    [HAL_OUTPUT_TYPE_SEGMENTATION]      = "SEGMENTATION",
-    [HAL_OUTPUT_TYPE_MASK_COEFFICIENTS] = "MASK_COEFF",
-    [HAL_OUTPUT_TYPE_MASK]              = "MASK",
-    [HAL_OUTPUT_TYPE_CLASSES]           = "CLASSES",
+  static const char *type_names[EDGEFIRST_HAL_OUTPUT_CLASSES + 1] = {
+    [EDGEFIRST_HAL_OUTPUT_DETECTION]         = "DETECTION",
+    [EDGEFIRST_HAL_OUTPUT_BOXES]             = "BOXES",
+    [EDGEFIRST_HAL_OUTPUT_SCORES]            = "SCORES",
+    [EDGEFIRST_HAL_OUTPUT_PROTOS]            = "PROTOS",
+    [EDGEFIRST_HAL_OUTPUT_SEGMENTATION]      = "SEGMENTATION",
+    [EDGEFIRST_HAL_OUTPUT_MASK_COEFFICIENTS] = "MASK_COEFF",
+    [EDGEFIRST_HAL_OUTPUT_MASK]              = "MASK",
+    [EDGEFIRST_HAL_OUTPUT_CLASSES]           = "CLASSES",
   };
 
   for (gint i = 0; i < self->tensor_count; i++) {
@@ -909,7 +899,7 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
     size_t out_shape[MAX_NDIM] = {0};
     memcpy (out_shape, self->tensor_shapes[i], ndim * sizeof (size_t));
 
-    enum HalOutputType type;
+    uint32_t type;
 
     /* Protos: 3D tensor with a small channel dimension relative to two
      * equal-or-near-equal spatial dimensions. After parse_nnstreamer_dims
@@ -963,7 +953,7 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
     }
 
     if (is_protos) {
-      type = HAL_OUTPUT_TYPE_PROTOS;
+      type = EDGEFIRST_HAL_OUTPUT_PROTOS;
       ndim = 4;
     } else if (has_split_boxes) {
       /* Split-box output: determine features vs anchors using min-dimension heuristic.
@@ -981,15 +971,15 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
       ndim = 3;
 
       if (nf == 4)
-        type = HAL_OUTPUT_TYPE_BOXES;
+        type = EDGEFIRST_HAL_OUTPUT_BOXES;
       else if (has_protos && proto_channels > 0 && nf == proto_channels)
-        type = HAL_OUTPUT_TYPE_MASK_COEFFICIENTS;
+        type = EDGEFIRST_HAL_OUTPUT_MASK_COEFFICIENTS;
       else
-        type = HAL_OUTPUT_TYPE_SCORES;
+        type = EDGEFIRST_HAL_OUTPUT_SCORES;
     } else {
       /* Fused detection — always 3D [1, features, boxes].
        * NNStreamer reversed 2D: [feat, boxes]. */
-      type = HAL_OUTPUT_TYPE_DETECTION;
+      type = EDGEFIRST_HAL_OUTPUT_DETECTION;
       if (ndim == 2) {
         size_t nf = out_shape[0], nb = out_shape[1];
         out_shape[0] = 1; out_shape[1] = nf; out_shape[2] = nb;
@@ -1009,7 +999,7 @@ overlay_parse_tensor_caps (EdgefirstOverlay *self, GstCaps *caps)
       pos += g_snprintf (shape_str + pos, sizeof (shape_str) - pos, ",%zu", out_shape[j]);
     g_strlcat (shape_str, "]", sizeof (shape_str));
     GST_INFO_OBJECT (self, "  [%d] %-11s ndim=%zu dtype=%d shape=%s",
-        i, (type <= HAL_OUTPUT_TYPE_CLASSES && type_names[type]) ? type_names[type] : "?",
+        i, (type <= EDGEFIRST_HAL_OUTPUT_CLASSES && type_names[type]) ? type_names[type] : "?",
         ndim, self->tensor_dtypes[i], shape_str);
   }
 
@@ -1154,13 +1144,13 @@ overlay_try_metadata_decoder (EdgefirstOverlay *self)
 
   GST_INFO_OBJECT (self, "creating decoder from model-metadata (config-based path)");
 
-  struct hal_decoder_params *params = hal_decoder_params_new ();
-  hal_decoder_params_set_config_json (params, meta_json, strlen (meta_json));
-  hal_decoder_params_set_score_threshold (params, self->score_threshold);
-  hal_decoder_params_set_iou_threshold (params, self->iou_threshold);
+  ef_decoder_params *params = ef_decoder_params_new ();
+  ef_decoder_params_set_config_json (params, meta_json, strlen (meta_json));
+  ef_decoder_params_set_score_threshold (params, self->score_threshold);
+  ef_decoder_params_set_iou_threshold (params, self->iou_threshold);
 
-  self->decoder = hal_decoder_new (params);
-  hal_decoder_params_free (params);
+  self->decoder = ef_decoder_new (params);
+  ef_decoder_params_free (params);
   g_free (meta_json);
 
   if (!self->decoder) {
@@ -1174,12 +1164,12 @@ overlay_try_metadata_decoder (EdgefirstOverlay *self)
    * authoritative source for the normalized flag. The per-output
    * quantization and coordinate convention are baked into the schema.
    * Always use the decoder's value — ignore the property override. */
-  self->normalized = hal_decoder_normalized_boxes (self->decoder);
+  self->normalized = ef_decoder_normalized_boxes (self->decoder);
 
   /* Compute model input size from protos if not already set */
   if (self->model_width == 0 || self->model_height == 0) {
     for (gint i = 0; i < self->tensor_count; i++) {
-      if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS && self->hal_ndims[i] == 4) {
+      if (self->tensor_types[i] == EDGEFIRST_HAL_OUTPUT_PROTOS && self->hal_ndims[i] == 4) {
         /* NCHW: H at index 2, or NHWC: H at index 1 */
         size_t proto_h = self->tensor_protos_is_nhwc[i]
             ? self->hal_shapes[i][1] : self->hal_shapes[i][2];
@@ -1213,11 +1203,11 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
   /* ── Priority 2: auto-config from tensor caps + quant meta ─────── */
   GST_INFO_OBJECT (self, "no model-metadata found, using auto-config path");
 
-  struct hal_decoder_params *params = hal_decoder_params_new ();
-  hal_decoder_params_set_score_threshold (params, self->score_threshold);
-  hal_decoder_params_set_iou_threshold   (params, self->iou_threshold);
-  hal_decoder_params_set_decoder_version (params, parse_decoder_version (self->decoder_version));
-  hal_decoder_params_set_nms (params, HAL_NMS_CLASS_AGNOSTIC);
+  ef_decoder_params *params = ef_decoder_params_new ();
+  ef_decoder_params_set_score_threshold (params, self->score_threshold);
+  ef_decoder_params_set_iou_threshold   (params, self->iou_threshold);
+  ef_decoder_params_set_decoder_version (params, parse_decoder_version (self->decoder_version));
+  ef_decoder_params_set_nms (params, EDGEFIRST_HAL_NMS_CLASS_AGNOSTIC);
 
   /* Infer model input size from protos spatial dims (160*4=640) or model_width property.
    * Proto H axis position depends on declared layout:
@@ -1225,7 +1215,7 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
    *   NCHW [1, C, H, W] → H at axis 2 */
   guint model_input_size = self->model_width > 0 ? self->model_width : 640;
   for (gint i = 0; i < self->tensor_count; i++) {
-    if (self->tensor_types[i] == HAL_OUTPUT_TYPE_PROTOS && self->hal_ndims[i] == 4) {
+    if (self->tensor_types[i] == EDGEFIRST_HAL_OUTPUT_PROTOS && self->hal_ndims[i] == 4) {
       size_t proto_h = self->tensor_protos_is_nhwc[i]
           ? self->hal_shapes[i][1]  /* H at axis 1 for NHWC */
           : self->hal_shapes[i][2]; /* H at axis 2 for NCHW */
@@ -1255,59 +1245,62 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
   gint boxes_idx = -1;  /* track which decoder output is boxes/detection */
 
   for (gint i = 0; i < self->tensor_count; i++) {
-    enum HalOutputType type = self->tensor_types[i];
+    uint32_t type = self->tensor_types[i];
     size_t ndim = self->hal_ndims[i];
 
     /* Build dim names from type */
-    enum HalDimName dims[MAX_NDIM];
+    uint32_t dims[MAX_NDIM];
     switch (type) {
-      case HAL_OUTPUT_TYPE_PROTOS:
+      case EDGEFIRST_HAL_OUTPUT_PROTOS:
         /* Dim names must match declared shape order, which must match the
          * physical memory layout detected in overlay_parse_tensor_caps. */
-        dims[0] = HAL_DIM_NAME_BATCH;
+        dims[0] = EDGEFIRST_HAL_DIM_BATCH;
         if (self->tensor_protos_is_nhwc[i]) {
-          dims[1] = HAL_DIM_NAME_HEIGHT;
-          dims[2] = HAL_DIM_NAME_WIDTH;
-          dims[3] = HAL_DIM_NAME_NUM_PROTOS;
+          dims[1] = EDGEFIRST_HAL_DIM_HEIGHT;
+          dims[2] = EDGEFIRST_HAL_DIM_WIDTH;
+          dims[3] = EDGEFIRST_HAL_DIM_NUM_PROTOS;
         } else {
-          dims[1] = HAL_DIM_NAME_NUM_PROTOS;
-          dims[2] = HAL_DIM_NAME_HEIGHT;
-          dims[3] = HAL_DIM_NAME_WIDTH;
+          dims[1] = EDGEFIRST_HAL_DIM_NUM_PROTOS;
+          dims[2] = EDGEFIRST_HAL_DIM_HEIGHT;
+          dims[3] = EDGEFIRST_HAL_DIM_WIDTH;
         }
         break;
-      case HAL_OUTPUT_TYPE_BOXES:
-        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_BOX_COORDS;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+      case EDGEFIRST_HAL_OUTPUT_BOXES:
+        dims[0] = EDGEFIRST_HAL_DIM_BATCH; dims[1] = EDGEFIRST_HAL_DIM_BOX_COORDS;
+        dims[2] = EDGEFIRST_HAL_DIM_NUM_BOXES;
         break;
-      case HAL_OUTPUT_TYPE_MASK_COEFFICIENTS:
-        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_NUM_PROTOS;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+      case EDGEFIRST_HAL_OUTPUT_MASK_COEFFICIENTS:
+        dims[0] = EDGEFIRST_HAL_DIM_BATCH; dims[1] = EDGEFIRST_HAL_DIM_NUM_PROTOS;
+        dims[2] = EDGEFIRST_HAL_DIM_NUM_BOXES;
         break;
-      case HAL_OUTPUT_TYPE_SCORES:
-        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_NUM_CLASSES;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+      case EDGEFIRST_HAL_OUTPUT_SCORES:
+        dims[0] = EDGEFIRST_HAL_DIM_BATCH; dims[1] = EDGEFIRST_HAL_DIM_NUM_CLASSES;
+        dims[2] = EDGEFIRST_HAL_DIM_NUM_BOXES;
         break;
       default: /* DETECTION */
-        dims[0] = HAL_DIM_NAME_BATCH; dims[1] = HAL_DIM_NAME_NUM_FEATURES;
-        dims[2] = HAL_DIM_NAME_NUM_BOXES;
+        dims[0] = EDGEFIRST_HAL_DIM_BATCH; dims[1] = EDGEFIRST_HAL_DIM_NUM_FEATURES;
+        dims[2] = EDGEFIRST_HAL_DIM_NUM_BOXES;
         break;
     }
 
-    gint idx = hal_decoder_params_add_output (params, type,
-        HAL_DECODER_TYPE_ULTRALYTICS, self->hal_shapes[i], dims, ndim);
+    uintptr_t shape[MAX_NDIM];
+    for (size_t j = 0; j < ndim && j < MAX_NDIM; j++)
+      shape[j] = self->hal_shapes[i][j];
+    gint idx = ef_decoder_params_add_output (params, type,
+        EDGEFIRST_HAL_DECODER_ULTRALYTICS, shape, dims, ndim);
 
     gboolean is_norm = (self->normalized_prop != OVERLAY_NORMALIZED_FALSE);
-    if (idx >= 0 && (type == HAL_OUTPUT_TYPE_BOXES || type == HAL_OUTPUT_TYPE_DETECTION)) {
+    if (idx >= 0 && (type == EDGEFIRST_HAL_OUTPUT_BOXES || type == EDGEFIRST_HAL_OUTPUT_DETECTION)) {
       /* Always tell the decoder our output is normalized: for TFLite the
        * quant values are natively [0,1]; for pixel-space DVM exports the
        * scale adjustment below converts them to [0,1]. Either way the
        * decoder must not apply its own normalization on top. */
-      hal_decoder_params_output_set_normalized (params, idx, 1);
+      ef_decoder_params_output_set_normalized (params, idx, 1);
       boxes_idx = idx;
     }
 
     /* Set quantization: prefer actual quant meta, fall back to identity */
-    if (self->tensor_dtypes[i] != HAL_DTYPE_F32 && idx >= 0) {
+    if (self->tensor_dtypes[i] != EF_DTYPE_F32 && idx >= 0) {
       gfloat scale = 1.0f;
       gint   zp    = 0;
 
@@ -1332,19 +1325,19 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
        * pixel-space via `normalized=false`, divide the quant scale by the
        * model input size so the HAL decoder still sees [0,1] coordinates. */
       if (!is_norm
-          && (type == HAL_OUTPUT_TYPE_BOXES || type == HAL_OUTPUT_TYPE_DETECTION)
+          && (type == EDGEFIRST_HAL_OUTPUT_BOXES || type == EDGEFIRST_HAL_OUTPUT_DETECTION)
           && model_input_size > 0 && scale != 1.0f) {
         scale /= (gfloat) model_input_size;
         GST_DEBUG_OBJECT (self, "  [%d] boxes scale adjusted by /%u → %g "
             "(pixel-space quant → [0,1])", i, model_input_size, scale);
       }
 
-      hal_decoder_params_output_set_quantization (params, idx, scale, zp);
+      ef_decoder_params_output_set_quantization (params, idx, scale, zp);
     }
   }
 
-  self->decoder = hal_decoder_new (params);
-  hal_decoder_params_free (params);
+  self->decoder = ef_decoder_new (params);
+  ef_decoder_params_free (params);
 
   if (!self->decoder) {
     GST_WARNING_OBJECT (self,
@@ -1357,7 +1350,7 @@ overlay_create_decoder (EdgefirstOverlay *self, GstBuffer *buf)
    * normalized (line 1172) and the quant scale was divided by model_input_size.
    * So regardless of the user's `normalized` property, the decoded boxes
    * ARE in [0,1].  Always query the decoder for the ground truth. */
-  self->normalized = hal_decoder_normalized_boxes (self->decoder);
+  self->normalized = ef_decoder_normalized_boxes (self->decoder);
 
   GST_INFO_OBJECT (self, "decoder created: %d tensors, normalized=%d, "
       "quant_meta=%s", self->tensor_count, self->normalized,
@@ -1403,7 +1396,7 @@ parse_class_colors (const gchar *str, uint8_t (**out_colors)[4])
 /* ── Helper: create_input_image ──────────────────────────────────── */
 
 /* Forward declaration for the inode-cached wrapper below. */
-static hal_tensor *create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf);
+static ef_tensor *create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf);
 
 /* Resolve the camera-frame GstBuffer to a HAL tensor suitable for use as
  * the `background` argument of draw_decoded_masks.
@@ -1411,17 +1404,17 @@ static hal_tensor *create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
  * For DMA-BUF inputs the same physical buffer is recycled across frames
  * (v4l2src / v4l2h264dec / camera HAL pools). The dmabuf fd's inode
  * uniquely identifies the underlying memory, so we cache the imported
- * hal_tensor by inode — HAL's internal EGLImage stays warm and we avoid
+ * ef_tensor by inode — HAL's internal EGLImage stays warm and we avoid
  * paying the import cost on every frame. The cache owns the tensor;
  * callers must NOT free the returned pointer.
  *
  * For non-DMA inputs (memcpy fallback) we cannot cache because each
  * frame's pixel data is in a fresh system-memory buffer; *out_owned is
- * set to TRUE and the caller must hal_tensor_free() the result.
+ * set to TRUE and the caller must ef_tensor_free() the result.
  *
  * Same import-once-per-fd pattern that edgefirstcameraadaptor and the
  * yolov8n_seg_ara2 reference demo both use. */
-static hal_tensor *
+static ef_tensor *
 import_camera_frame_cached (EdgefirstOverlay *self, GstBuffer *inbuf,
     gboolean *out_owned)
 {
@@ -1433,12 +1426,12 @@ import_camera_frame_cached (EdgefirstOverlay *self, GstBuffer *inbuf,
     struct stat st;
     if (fstat (fd, &st) == 0) {
       gint64 ino = (gint64) st.st_ino;
-      hal_tensor *cached = g_hash_table_lookup (self->frame_tensor_cache, &ino);
+      ef_tensor *cached = g_hash_table_lookup (self->frame_tensor_cache, &ino);
       if (cached) {
         GST_LOG_OBJECT (self, "camera frame cache hit ino=%" G_GINT64_FORMAT, ino);
         return cached;
       }
-      hal_tensor *t = create_input_image (self, inbuf);
+      ef_tensor *t = create_input_image (self, inbuf);
       if (!t) return NULL;
       gint64 *key = g_new (gint64, 1);
       *key = ino;
@@ -1456,29 +1449,24 @@ import_camera_frame_cached (EdgefirstOverlay *self, GstBuffer *inbuf,
 }
 
 /* Create a HAL input tensor from a GstBuffer.
- * Tries DMABuf zero-copy via hal_import_image first; falls back to
- * hal_image_processor_create_image + memcpy.
- * Returns a new hal_tensor that the caller must free with hal_tensor_free(). */
-static hal_tensor *
+ * Tries a DMA-BUF zero-copy import first; falls back to a HAL-allocated
+ * image + memcpy.
+ * Returns a new ef_tensor that the caller must free with ef_tensor_free(). */
+static ef_tensor *
 create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
 {
   GstVideoInfo *info = &self->in_info;
   guint width  = (guint) self->display_w;
   guint height = (guint) self->display_h;
-  enum hal_pixel_format pixel_fmt = self->src_pixel_format;
+  const EdgefirstHalFormat *pixel_fmt = self->src_pixel_format;
+
+  if (!pixel_fmt) {
+    GST_ERROR_OBJECT (self, "unsupported input pixel format");
+    return NULL;
+  }
 
   /* Determine packed row_bytes for memcpy fallback */
-  size_t row_bytes;
-  switch (pixel_fmt) {
-    case HAL_PIXEL_FORMAT_RGB:   row_bytes = width * 3; break;
-    case HAL_PIXEL_FORMAT_RGBA:  row_bytes = width * 4; break;
-    case HAL_PIXEL_FORMAT_GREY:  row_bytes = width;     break;
-    case HAL_PIXEL_FORMAT_YUYV:  row_bytes = width * 2; break;
-    case HAL_PIXEL_FORMAT_NV12:  row_bytes = width;     break;
-    default:
-      GST_ERROR_OBJECT (self, "unsupported input pixel format %d", pixel_fmt);
-      return NULL;
-  }
+  size_t row_bytes = edgefirst_hal_format_row_bytes (pixel_fmt, width);
 
   /* Prefer GstVideoMeta for plane layout — it is the authoritative record of
    * the actual buffer strides and offsets set by the producer (e.g.
@@ -1498,43 +1486,33 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
   GstMemory *in_mem = gst_buffer_peek_memory (inbuf, 0);
   if (gst_is_dmabuf_memory (in_mem)) {
     int fd = gst_dmabuf_memory_get_fd (in_mem);
-    struct hal_plane_descriptor *pd = hal_plane_descriptor_new (fd);
-    if (pd) {
-      hal_plane_descriptor_set_stride (pd, (size_t) y_stride);
-      if (y_offset > 0)
-        hal_plane_descriptor_set_offset (pd, y_offset);
+    EdgefirstHalPlane image = {
+      .fd = fd, .offset = y_offset, .stride = (gsize) MAX (y_stride, 0),
+    };
 
-      struct hal_plane_descriptor *chroma = NULL;
-      if (pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
-        int   uv_fd = fd;
-        gsize chroma_offset = uv_offset;
-        if (n_mem >= 2) {
-          /* UV in its own GstMemory block: use that fd, offset starts at 0 */
-          GstMemory *mem1 = gst_buffer_peek_memory (inbuf, 1);
-          if (gst_is_dmabuf_memory (mem1)) {
-            uv_fd = gst_dmabuf_memory_get_fd (mem1);
-            chroma_offset = 0;
-          }
-        }
-        /* Always attach a chroma descriptor for NV12 so HAL uses the exact
-         * UV offset we pass rather than computing it from (Y stride × height),
-         * which is only correct for unpadded layouts. */
-        chroma = hal_plane_descriptor_new (uv_fd);
-        if (chroma) {
-          hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
-          if (chroma_offset > 0)
-            hal_plane_descriptor_set_offset (chroma, chroma_offset);
-        }
+    /* Always pass the chroma plane for NV12 so HAL uses the exact UV
+     * offset rather than computing it from (Y stride × height), which is
+     * only correct for unpadded layouts. */
+    EdgefirstHalPlane chroma_plane = {
+      .fd = fd, .offset = uv_offset, .stride = (gsize) MAX (uv_stride, 0),
+    };
+    EdgefirstHalPlane *chroma = NULL;
+    if (pixel_fmt->layout == EDGEFIRST_HAL_LAYOUT_SEMI_PLANAR) {
+      /* UV in its own GstMemory block: use that fd, offset starts at 0 */
+      GstMemory *mem1 = n_mem >= 2 ? gst_buffer_peek_memory (inbuf, 1) : NULL;
+      if (mem1 && gst_is_dmabuf_memory (mem1)) {
+        chroma_plane.fd = gst_dmabuf_memory_get_fd (mem1);
+        chroma_plane.offset = 0;
       }
-
-      /* hal_import_image CONSUMES pd and chroma */
-      hal_tensor *t = hal_import_image (self->processor,
-          pd, chroma, (size_t) width, (size_t) height, pixel_fmt, HAL_DTYPE_U8);
-      if (t)
-        return t;
-
-      GST_DEBUG_OBJECT (self, "hal_import_image failed for fd=%d", fd);
+      chroma = &chroma_plane;
     }
+
+    ef_tensor *t = edgefirst_hal_import_image (GST_OBJECT (self), &image,
+        chroma, width, height, pixel_fmt, EF_DTYPE_U8);
+    if (t)
+      return t;
+
+    GST_DEBUG_OBJECT (self, "HAL image import failed for fd=%d", fd);
   }
 
   /* Memcpy fallback: warn once so pipeline operators can identify
@@ -1542,7 +1520,7 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
   static gboolean memcpy_warned = FALSE;
   if (G_UNLIKELY (!memcpy_warned)) {
     memcpy_warned = TRUE;
-    GST_INFO_OBJECT (self, "Input is not DMABuf or hal_import_image failed; "
+    GST_INFO_OBJECT (self, "Input is not DMABuf or the HAL import failed; "
         "using memcpy path");
   } else {
     GST_LOG_OBJECT (self, "memcpy fallback: copying input frame");
@@ -1550,55 +1528,57 @@ create_input_image (EdgefirstOverlay *self, GstBuffer *inbuf)
 
   /* System-memory path: allocate HAL image and copy frame data into it */
   guint64 t0_input = _get_time_ns ();
-  hal_tensor *tensor = hal_image_processor_create_image (self->processor,
-      (size_t) width, (size_t) height, pixel_fmt, HAL_DTYPE_U8);
+  ef_tensor *tensor = edgefirst_hal_create_image (self->processor,
+      width, height, pixel_fmt, EF_DTYPE_U8);
   guint64 t1_input = _get_time_ns ();
-  GST_INFO_OBJECT (self, "hal_image_processor_create_image (input %zux%zu fmt=%d) "
-      "took %.1f ms", (size_t) width, (size_t) height, pixel_fmt,
-      (t1_input - t0_input) / 1e6);
+  GST_INFO_OBJECT (self, "HAL create_image (input %ux%u %s) took %.1f ms",
+      width, height, pixel_fmt->wire, (t1_input - t0_input) / 1e6);
   if (!tensor)
     return NULL;
 
-  struct hal_tensor_map *tmap = hal_tensor_map_create (tensor);
-  if (!tmap) {
-    hal_tensor_free (tensor);
+  ef_tensor_view view;
+  if (ef_tensor_map (tensor, EF_CPU_ACCESS_WRITE, &view) != 0) {
+    ef_tensor_free (tensor);
     return NULL;
   }
 
-  uint8_t *dst = (uint8_t *) hal_tensor_map_data (tmap);
+  uint8_t *dst = view.ptr;
+  gsize dst_stride = edgefirst_hal_row_stride (tensor);
+  if (dst_stride < row_bytes)
+    dst_stride = row_bytes;
 
   GstVideoFrame frame;
   if (!gst_video_frame_map (&frame, info, inbuf, GST_MAP_READ)) {
-    hal_tensor_map_unmap (tmap);
-    hal_tensor_free (tensor);
+    ef_tensor_unmap (tensor);
+    ef_tensor_free (tensor);
     return NULL;
   }
 
-  if (pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
+  if (pixel_fmt->layout == EDGEFIRST_HAL_LAYOUT_SEMI_PLANAR) {
     /* Y plane */
     const guint8 *y_data = (const guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
     gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
     for (guint y = 0; y < height; y++)
-      memcpy (dst + y * width, y_data + y * y_stride, width);
+      memcpy (dst + y * dst_stride, y_data + y * y_stride, width);
     /* UV plane */
     const guint8 *uv_data = (const guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&frame, 1);
     gint uv_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 1);
-    uint8_t *uv_dst = dst + height * width;
+    uint8_t *uv_dst = dst + height * dst_stride;
     for (guint y = 0; y < height / 2; y++)
-      memcpy (uv_dst + y * width, uv_data + y * uv_stride, width);
+      memcpy (uv_dst + y * dst_stride, uv_data + y * uv_stride, width);
   } else {
     const guint8 *src_data = (const guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
     gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
-    if ((gsize) stride == row_bytes) {
+    if ((gsize) stride == row_bytes && dst_stride == row_bytes) {
       memcpy (dst, src_data, row_bytes * height);
     } else {
       for (guint y = 0; y < height; y++)
-        memcpy (dst + y * row_bytes, src_data + y * stride, row_bytes);
+        memcpy (dst + y * dst_stride, src_data + y * stride, row_bytes);
     }
   }
 
   gst_video_frame_unmap (&frame);
-  hal_tensor_map_unmap (tmap);
+  ef_tensor_unmap (tensor);
   return tensor;
 }
 
@@ -1621,7 +1601,13 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
 
   self->in_info       = info;
   self->in_info_valid = TRUE;
-  self->src_pixel_format = gst_format_to_hal (GST_VIDEO_INFO_FORMAT (&info));
+  self->src_pixel_format =
+      edgefirst_hal_format_from_gst (GST_VIDEO_INFO_FORMAT (&info));
+  if (!self->src_pixel_format) {
+    GST_ERROR_OBJECT (self, "Unsupported video format %s",
+        gst_video_format_to_string (GST_VIDEO_INFO_FORMAT (&info)));
+    return FALSE;
+  }
   self->display_w     = (guint) GST_VIDEO_INFO_WIDTH (&info);
   self->display_h     = (guint) GST_VIDEO_INFO_HEIGHT (&info);
 
@@ -1630,7 +1616,8 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
     uint8_t (*colors)[4] = NULL;
     gsize n = parse_class_colors (self->class_colors, &colors);
     if (n > 0) {
-      hal_image_processor_set_class_colors (self->processor, colors, n);
+      ef_image_processor_set_class_colors (self->processor,
+          (const uint8_t (*)[4]) colors, n);
       GST_INFO_OBJECT (self, "set %zu class colors", n);
     }
     g_free (colors);
@@ -1641,11 +1628,12 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
    * downstream consumers (e.g. waylandsink holding the front buffer plus a
    * queued back buffer) keep their fds valid while we render into the third. */
   for (int i = 0; i < 3; i++) {
-    hal_tensor_free (self->display_images[i]);
+    ef_tensor_free (self->display_images[i]);
     guint64 t0 = _get_time_ns ();
-    self->display_images[i] = hal_image_processor_create_image (self->processor,
-        (size_t) self->display_w, (size_t) self->display_h,
-        HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    self->display_images[i] = edgefirst_hal_create_image (self->processor,
+        self->display_w, self->display_h,
+        edgefirst_hal_format_from_wire (EDGEFIRST_HAL_FORMAT_RGBA),
+        EF_DTYPE_U8);
     guint64 t1 = _get_time_ns ();
     GST_INFO_OBJECT (self, "create_image buf[%d] %ux%u RGBA: %.1f ms",
         i, self->display_w, self->display_h, (t1 - t0) / 1e6);
@@ -1658,12 +1646,13 @@ overlay_set_video_caps (EdgefirstOverlay *self, GstCaps *caps)
   self->display_buf_idx = 0;
 
   /* Probe DMA-BUF availability once; all images were allocated identically. */
-  int test_fd = hal_tensor_dmabuf_clone (self->display_images[0]);
-  if (test_fd >= 0) {
-    close (test_fd);
-    self->display_is_dmabuf = TRUE;
-  } else {
-    self->display_is_dmabuf = FALSE;
+  self->display_is_dmabuf = FALSE;
+  if (ef_tensor_storage_kind (self->display_images[0]) == EF_STORAGE_KIND_DMA_BUF) {
+    int test_fd = ef_tensor_clone_fd (self->display_images[0]);
+    if (test_fd >= 0) {
+      close (test_fd);
+      self->display_is_dmabuf = TRUE;
+    }
   }
 
   GST_INFO_OBJECT (self, "display image %ux%u RGBA, dmabuf=%s (triple-buffered)",
@@ -1823,45 +1812,28 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   /* Snapshot decoded results under lock.
    * When model_sync=TRUE the mutex is still held from the wait loop above;
    * when model_sync=FALSE we acquire it here. Either way we release it below.
-   *
-   * Proto path: when proto_snap is set (segmentation model with v2 schema),
-   * we borrow it for draw_proto_masks. The proto_snap pointer remains valid
-   * as long as the lock is held or until the tensor chain replaces it.
-   * Since draw_proto_masks is fast (~14ms GPU) and we hold the proto_snap
-   * pointer only for the duration of the draw call, there is no risk of the
-   * tensor chain freeing it underneath us — the tensor chain acquires the
-   * lock before replacing proto_snap.
-   *
-   * Important: proto_snap is NOT ref-counted. We must NOT hold the lock
-   * during draw (GPU work can take >10ms). Instead, we "borrow" the pointer
-   * atomically and set it to NULL so the tensor chain won't free it while
-   * we're using it. We re-store it after drawing. */
+   * The snapshots are references, so the tensor chain can replace the
+   * stored results while this frame is drawn. */
   EdgeFirstDetectBoxList    *boxes_snap = NULL;
   EdgeFirstSegmentationList *segs_snap  = NULL;
-  struct hal_proto_data     *proto_draw = NULL;
   {
     if (!self->model_sync) g_mutex_lock (&self->lock);
     boxes_snap = self->boxes_obj ? g_object_ref (self->boxes_obj) : NULL;
     segs_snap  = self->segs_obj  ? g_object_ref (self->segs_obj)  : NULL;
-    /* Borrow proto_snap: take ownership temporarily, tensor chain will
-     * allocate a new one on next decode. This avoids holding the lock
-     * during the GPU draw call. */
-    proto_draw = self->proto_snap;
-    self->proto_snap = NULL;
     g_mutex_unlock (&self->lock);
   }
 
   /* ── Import camera frame as background ────────────────────────── */
   /* Pick the current back buffer in the triple-buffered ring; the other two
    * may still be held by waylandsink (front + queued back). */
-  hal_tensor *display_image = self->display_images[self->display_buf_idx];
+  ef_tensor *display_image = self->display_images[self->display_buf_idx];
 
   /* Import the upstream camera frame in its native pixel format (NV12, YUYV,
    * RGBA, …). For DMA-BUF inputs this resolves through an inode cache so
    * HAL keeps the EGLImage handle warm across frames; for the memcpy fallback
    * a fresh tensor is allocated and we own it. */
   gboolean src_owned = FALSE;
-  hal_tensor *src_img = import_camera_frame_cached (self, buf, &src_owned);
+  ef_tensor *src_img = import_camera_frame_cached (self, buf, &src_owned);
   if (!src_img) {
     g_clear_object (&boxes_snap);
     g_clear_object (&segs_snap);
@@ -1870,44 +1842,28 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
   }
 
   /* ── Draw overlay (background + boxes + masks) onto display_image ─ */
-  /* HAL's draw_decoded_masks / draw_proto_masks accept a `background`
-   * tensor that is GPU-blitted onto the framebuffer before compositing
-   * boxes and masks.  When background is NULL the GL backend clears to
-   * black — so we always pass src_img.
+  /* HAL's draw_decoded_masks accepts a `background` tensor that is
+   * GPU-blitted onto the framebuffer before compositing boxes and masks.
+   * When background is NULL the GL backend clears to black — so we always
+   * pass src_img.
    *
-   * IMPORTANT: the tensor chain eagerly materializes masks (CPU, ~1 ms)
-   * so proto_snap is always NULL here and the video chain uses
-   * draw_decoded_masks (GL blit + boxes + masks, ~15 ms on Vivante).
-   * draw_proto_masks (GPU fused proto→mask matmul) is >2 s on Vivante
-   * because the fragment shader overwhelms the GC7000. */
-  hal_detect_box_list    *boxes_hal = edgefirst_detect_box_list_get_hal (boxes_snap);
+   * The tensor chain eagerly materializes masks (CPU, ~1 ms), so the video
+   * chain always uses draw_decoded_masks (GL blit + boxes + masks, ~15 ms
+   * on Vivante). draw_proto_masks (GPU fused proto→mask matmul) is >2 s on
+   * Vivante because the fragment shader overwhelms the GC7000. */
+  guint n_boxes = 0;
+  guint n_segs = 0;
+  const ef_detect_box *boxes = edgefirst_detect_box_list_get_data (boxes_snap, &n_boxes);
+  const ef_segmentation *segs = edgefirst_segmentation_list_get_data (segs_snap, &n_segs);
 
   guint64 t0_draw = _get_time_ns ();
-  int draw_ret;
-
-  if (proto_draw && boxes_hal) {
-    /* Fused GPU path: proto matmul at full resolution on GPU.
-     * Only reached if eager materialization failed or was skipped. */
-    draw_ret = hal_image_processor_draw_proto_masks (self->processor,
-        display_image, boxes_hal, proto_draw, src_img, self->opacity,
-        overlay_effective_letterbox (self),
-        (enum hal_color_mode) self->color_mode);
-  } else {
-    /* Pre-materialized masks (or detection-only).  This is the normal
-     * hot path — background blit + box rendering + mask blit via GL. */
-    hal_segmentation_list *segs_hal = edgefirst_segmentation_list_get_hal (segs_snap);
-    draw_ret = hal_image_processor_draw_decoded_masks (self->processor,
-        display_image, boxes_hal, segs_hal, src_img, self->opacity,
-        overlay_effective_letterbox (self),
-        (enum hal_color_mode) self->color_mode);
-  }
-
+  int draw_ret = ef_image_processor_draw_decoded_masks (self->processor,
+      display_image, boxes, n_boxes, segs, n_segs, src_img, self->opacity,
+      overlay_effective_letterbox (self), color_mode_to_hal (self->color_mode));
   guint64 t1_draw = _get_time_ns ();
   GST_INFO_OBJECT (self,
-      "%s: %.1f ms (boxes=%s proto=%s ret=%d)",
-      proto_draw ? "draw_proto_masks" : "draw_decoded_masks",
-      (t1_draw - t0_draw) / 1e6,
-      boxes_hal ? "yes" : "no", proto_draw ? "yes" : "no", draw_ret);
+      "draw_decoded_masks: %.1f ms (boxes=%u segs=%u ret=%d)",
+      (t1_draw - t0_draw) / 1e6, n_boxes, n_segs, draw_ret);
 
   /* Emit per-frame timing signal when instrumentation is enabled.
    * Carries the most recent decode + materialize ms (set by tensors_chain
@@ -1919,28 +1875,15 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
         self->last_decode_ms, self->last_materialize_ms, draw_ms);
   }
 
-  /* Return proto_draw to storage for reuse on subsequent video frames.
-   * The tensor chain may have already stored a newer proto_snap — if so,
-   * free the stale one we just used. */
-  {
-    g_mutex_lock (&self->lock);
-    if (self->proto_snap) {
-      hal_proto_data_free (proto_draw);
-    } else {
-      self->proto_snap = proto_draw;
-    }
-    g_mutex_unlock (&self->lock);
-    proto_draw = NULL;
-  }
-
   if (src_owned)
-    hal_tensor_free (src_img);
+    ef_tensor_free (src_img);
 
   g_clear_object (&boxes_snap);
   g_clear_object (&segs_snap);
 
   if (draw_ret != 0) {
-    GST_ERROR_OBJECT (self, "HAL draw masks failed (%d)", draw_ret);
+    GST_ERROR_OBJECT (self, "HAL draw masks failed (%d): %s", draw_ret,
+        ef_tensor_last_error_message ());
     gst_buffer_unref (buf);
     return GST_FLOW_ERROR;
   }
@@ -1952,10 +1895,12 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
 
   /* HAL >= 0.16.3 pads the row stride to 64-byte alignment on Mali Valhall;
    * query the actual stride for correct DMA-BUF size and GstVideoMeta. */
-  gsize row_stride = hal_tensor_row_stride (display_image);
+  gsize row_stride = edgefirst_hal_row_stride (display_image);
+  if (row_stride < (gsize) w * 4)
+    row_stride = (gsize) w * 4;
 
   if (self->display_is_dmabuf) {
-    int fd = hal_tensor_dmabuf_clone (display_image);
+    int fd = ef_tensor_clone_fd (display_image);
     if (fd >= 0) {
       outbuf = gst_buffer_new ();
       gst_buffer_append_memory (outbuf,
@@ -1972,11 +1917,11 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
     /* System-memory fallback: memcpy snapshot is safe with a single buffer
      * because the copy completes before the buffer is pushed downstream. */
     outbuf = gst_buffer_new_allocate (NULL, (gsize) w * h * 4, NULL);
-    struct hal_tensor_map *tmap = hal_tensor_map_create (display_image);
-    if (tmap) {
+    ef_tensor_view view;
+    if (ef_tensor_map (display_image, EF_CPU_ACCESS_READ, &view) == 0) {
       GstMapInfo map;
       if (gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
-        const guint8 *src = (const guint8 *) hal_tensor_map_data_const (tmap);
+        const guint8 *src = view.ptr;
         if (row_stride == (gsize) w * 4) {
           memcpy (map.data, src, (gsize) w * h * 4);
         } else {
@@ -1986,7 +1931,7 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
         }
         gst_buffer_unmap (outbuf, &map);
       }
-      hal_tensor_map_unmap (tmap);
+      ef_tensor_unmap (display_image);
     }
   }
 
@@ -2014,32 +1959,39 @@ edgefirst_overlay_video_chain (GstPad *pad G_GNUC_UNUSED,
 /* ── Helper: gst_memory_to_hal_tensor ────────────────────────────── */
 
 /* Create a HAL tensor wrapping a GstMemory block.
- * Tries DMABuf zero-copy first; falls back to hal_tensor_new + memcpy.
+ * Tries DMABuf zero-copy first; falls back to a host tensor + memcpy.
  * shape/ndim are used for the memcpy fallback; for DMABuf, the fd carries
  * the data. */
-static hal_tensor *
+static ef_tensor *
 gst_memory_to_hal_tensor (GstMemory *mem,
-    enum hal_dtype dtype, const size_t *shape, size_t ndim)
+    uint32_t dtype, const guint64 *shape, guint ndim)
 {
-  hal_tensor *t = NULL;
+  ef_tensor *t = NULL;
 
   if (gst_is_dmabuf_memory (mem)) {
     int fd = gst_dmabuf_memory_get_fd (mem);
-    t = hal_tensor_from_fd (dtype, fd, shape, ndim, NULL);
+    t = edgefirst_hal_wrap_fd (fd, dtype, shape, ndim);
   }
 
   if (!t) {
-    t = hal_tensor_new (dtype, shape, ndim, HAL_TENSOR_MEMORY_MEM, NULL);
+    t = edgefirst_hal_new_tensor (dtype, shape, ndim);
     if (!t) return NULL;
 
-    struct hal_tensor_map *tmap = hal_tensor_map_create (t);
-    if (!tmap) { hal_tensor_free (t); return NULL; }
+    ef_tensor_view view;
+    if (ef_tensor_map (t, EF_CPU_ACCESS_WRITE, &view) != 0) {
+      ef_tensor_free (t);
+      return NULL;
+    }
 
     GstMapInfo map;
-    gst_memory_map (mem, &map, GST_MAP_READ);
-    memcpy (hal_tensor_map_data (tmap), map.data, map.size);
+    if (!gst_memory_map (mem, &map, GST_MAP_READ)) {
+      ef_tensor_unmap (t);
+      ef_tensor_free (t);
+      return NULL;
+    }
+    memcpy (view.ptr, map.data, MIN (map.size, view.len));
     gst_memory_unmap (mem, &map);
-    hal_tensor_map_unmap (tmap);
+    ef_tensor_unmap (t);
   }
 
   return t;
@@ -2074,7 +2026,7 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
 
   /* ── Wrap GstBuffer memories as HAL tensors ─────────────────────── */
   guint n_mem = gst_buffer_n_memory (buf);
-  hal_tensor **outputs = g_new0 (hal_tensor *, n_mem);
+  ef_tensor **outputs = g_new0 (ef_tensor *, n_mem);
   gboolean ok = TRUE;
 
 #if HAVE_NNSTREAMER
@@ -2091,14 +2043,14 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
     /* Use HAL-convention shapes from auto-config if available.
      * These match the shapes registered with the decoder, so
      * find_outputs_with_shape will match correctly. */
-    size_t  ndim;
-    size_t  shape[8];
-    enum hal_dtype dtype = HAL_DTYPE_F32;
+    guint    ndim;
+    guint64  shape[8];
+    uint32_t dtype = EF_DTYPE_F32;
 
     if (i < (guint) self->tensor_count && self->hal_ndims[i] > 0) {
-      ndim  = self->hal_ndims[i];
+      ndim  = (guint) self->hal_ndims[i];
       dtype = self->tensor_dtypes[i];
-      for (size_t j = 0; j < ndim; j++)
+      for (guint j = 0; j < ndim; j++)
         shape[j] = self->hal_shapes[i][j];
     } else {
       size_t byte_size = gst_memory_get_sizes (mem, NULL, NULL);
@@ -2116,20 +2068,21 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
 #if HAVE_NNSTREAMER
     /* Attach per-tensor affine quantization for integer outputs. The
      * auto-config (no model-config) path attaches quant via
-     * hal_decoder_params_output_set_quantization during decoder build;
+     * ef_decoder_params_output_set_quantization during decoder build;
      * the schema-driven path builds the decoder before any buffer is
      * seen and instead reads quant live from each tensor, so we attach
      * it here for every frame. Skip float tensors (set_quantization
      * rejects them with EINVAL). */
-    if (qm && i < qm->num_tensors && dtype != HAL_DTYPE_F32) {
+    if (qm && i < qm->num_tensors && dtype != EF_DTYPE_F32) {
       const NnsTensorQuantInfo *qi = &qm->quant[i];
       if (qi->scheme != NNS_QUANT_NONE && qi->num_params > 0) {
-        float scale = (float) qi->scales[0];
-        int   zp    = (int)   qi->zero_points[0];
-        if (hal_tensor_set_quantization (outputs[i], scale, zp) != 0) {
+        float   scale = (float)   qi->scales[0];
+        int32_t zp    = (int32_t) qi->zero_points[0];
+        int qret = ef_tensor_quantization_set (outputs[i], -1, &scale, &zp, 1);
+        if (qret != 0) {
           GST_WARNING_OBJECT (self,
-              "hal_tensor_set_quantization[%u] failed (scale=%g zp=%d): %s",
-              i, scale, zp, strerror (errno));
+              "ef_tensor_quantization_set[%u] failed (scale=%g zp=%d): %s",
+              i, scale, zp, strerror (qret));
         }
       }
     }
@@ -2137,26 +2090,26 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   }
 
   if (!ok) {
-    for (guint i = 0; i < n_mem; i++) hal_tensor_free (outputs[i]);
+    for (guint i = 0; i < n_mem; i++) ef_tensor_free (outputs[i]);
     g_free (outputs);
     gst_buffer_unref (buf);
     return GST_FLOW_ERROR;
   }
 
   /* ── Decode ─────────────────────────────────────────────────────── */
-  hal_detect_box_list *new_boxes = NULL;
-  struct hal_proto_data *proto   = NULL;
+  ef_detect_box_list *new_boxes = NULL;
+  ef_proto_data      *proto     = NULL;
 
   guint64 t0_decode = _get_time_ns ();
-  proto = hal_decoder_decode_proto (self->decoder,
-      (const struct hal_tensor *const *) outputs, n_mem, &new_boxes);
+  proto = ef_decoder_decode_proto (self->decoder,
+      (const ef_tensor *const *) outputs, n_mem, &new_boxes);
   guint64 t1_decode = _get_time_ns ();
 
-  for (guint i = 0; i < n_mem; i++) hal_tensor_free (outputs[i]);
+  for (guint i = 0; i < n_mem; i++) ef_tensor_free (outputs[i]);
   g_free (outputs);
 
   if (!new_boxes) {
-    if (proto) hal_proto_data_free (proto);
+    ef_proto_data_free (proto);
     gst_buffer_unref (buf);
     GST_INFO_OBJECT (self, "decode: %.1f ms (0 boxes, errno=%d)",
         (t1_decode - t0_decode) / 1e6, errno);
@@ -2164,7 +2117,8 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
     return GST_FLOW_OK;   /* zero detections this frame */
   }
 
-  guint n_boxes = (guint) hal_detect_box_list_len (new_boxes);
+  guint n_boxes = (guint) ef_detect_box_list_len (new_boxes);
+  const ef_detect_box *boxes = ef_detect_box_list_data (new_boxes);
   GST_INFO_OBJECT (self, "decode: %.1f ms (%u boxes%s)",
       (t1_decode - t0_decode) / 1e6, n_boxes,
       proto ? ", has protos" : "");
@@ -2182,16 +2136,23 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
    * fall through to a pure-CPU draw_proto_masks fallback taking >2 seconds
    * per frame.  By materializing eagerly we guarantee the fast GL-only
    * draw_decoded_masks path is always used. */
-  hal_segmentation_list *new_segs = NULL;
+  ef_mask_list *new_segs = NULL;
   if (proto) {
     guint64 t0_mat = _get_time_ns ();
-    new_segs = hal_image_processor_materialize_masks (self->processor,
-        new_boxes, proto, overlay_effective_letterbox (self));
+    int32_t layout = ef_proto_data_layout (proto);
+    ef_tensor *protos = ef_proto_data_take_protos (proto);
+    ef_tensor *coeffs = ef_proto_data_take_mask_coefficients (proto);
+    if (protos && coeffs && layout >= 0)
+      new_segs = ef_image_processor_materialize_masks (self->processor,
+          boxes, n_boxes, protos, coeffs, (uint32_t) layout,
+          overlay_effective_letterbox (self));
     guint64 t1_mat = _get_time_ns ();
     GST_INFO_OBJECT (self, "materialize_masks: %.1f ms (%s)",
         (t1_mat - t0_mat) / 1e6, new_segs ? "ok" : "none");
     self->last_materialize_ms = (t1_mat - t0_mat) / 1e6;
-    hal_proto_data_free (proto);
+    ef_tensor_free (protos);
+    ef_tensor_free (coeffs);
+    ef_proto_data_free (proto);
     proto = NULL;
   }
 
@@ -2199,9 +2160,13 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   guint mw = self->model_width  > 0 ? self->model_width  : 0;
   guint mh = self->model_height > 0 ? self->model_height : 0;
   EdgeFirstDetectBoxList    *boxes_obj = edgefirst_detect_box_list_new_normalized (
-      new_boxes, self->normalized, mw, mh);
+      boxes, n_boxes, self->normalized, mw, mh);
+  ef_detect_box_list_free (new_boxes);
   EdgeFirstSegmentationList *segs_obj  = new_segs
-      ? edgefirst_segmentation_list_new (new_segs) : NULL;
+      ? edgefirst_segmentation_list_new (ef_mask_list_data (new_segs),
+            (guint) ef_mask_list_len (new_segs), new_segs,
+            (GDestroyNotify) ef_mask_list_free)
+      : NULL;
 
   /* ── Update stored state under lock ─────────────────────────────── */
   g_mutex_lock (&self->lock);
@@ -2209,10 +2174,6 @@ edgefirst_overlay_tensors_chain (GstPad *pad G_GNUC_UNUSED,
   g_clear_object (&self->segs_obj);
   self->boxes_obj = g_object_ref (boxes_obj);
   self->segs_obj  = segs_obj ? g_object_ref (segs_obj) : NULL;
-
-  /* Proto was consumed above by materialize_masks; proto_snap stays NULL
-   * so the video chain always takes the draw_decoded_masks path. */
-  if (self->proto_snap) { hal_proto_data_free (self->proto_snap); self->proto_snap = NULL; }
 
   if (GST_BUFFER_PTS (buf) != GST_CLOCK_TIME_NONE)
     self->decode_ts = GST_BUFFER_PTS (buf);

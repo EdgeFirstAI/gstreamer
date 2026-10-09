@@ -18,7 +18,18 @@ edgefirst_schemas_dep = dependency('edgefirst-schemas', version : '>=1.5',
 
 gst_allocators_dep = dependency('gstreamer-allocators-1.0', version : gst_version,
                                 required : get_option('hal'))
-edgefirst_hal_dep = dependency('edgefirst-hal', required : get_option('hal'))
+
+# EdgeFirst HAL C libraries. The decoder ABI is header-only and carries the
+# detection types the core library exposes.
+hal_version = '>=0.34.1'
+edgefirst_image_dep = dependency('edgefirst-image', version : hal_version,
+                                 required : get_option('hal'))
+edgefirst_decoder_dep = dependency('edgefirst-decoder', version : hal_version,
+                                   required : get_option('hal'))
+edgefirst_decoder_abi_dep = dependency('edgefirst-decoder-abi', version : hal_version,
+                                       required : get_option('hal'))
+edgefirst_hal_found = edgefirst_image_dep.found() and edgefirst_decoder_dep.found() \
+    and edgefirst_decoder_abi_dep.found()
 
 glib_dep = dependency('glib-2.0', version : '>=2.56')
 gobject_dep = dependency('gobject-2.0')

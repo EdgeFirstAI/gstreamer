@@ -8,7 +8,7 @@
 #define __EDGEFIRST_DETECTION_H__
 
 #include <glib-object.h>
-#include <edgefirst/hal.h>
+#include <edgefirst/detect.h>
 
 G_BEGIN_DECLS
 
@@ -48,26 +48,34 @@ G_DECLARE_FINAL_TYPE (EdgeFirstDetectBoxList, edgefirst_detect_box_list,
 
 /**
  * edgefirst_detect_box_list_new:
- * @list: (transfer full): HAL detect box list to wrap (takes ownership)
+ * @boxes: (array length=n_boxes) (nullable): HAL detections, copied
+ * @n_boxes: number of entries in @boxes
  *
- * Returns: (transfer full): a new #EdgeFirstDetectBoxList
+ * Box coordinates are taken to be normalized [0,1].
+ *
+ * Returns: (transfer full) (nullable): a new #EdgeFirstDetectBoxList, or
+ *   NULL when @boxes is NULL and @n_boxes is not zero
  */
-EdgeFirstDetectBoxList *edgefirst_detect_box_list_new (hal_detect_box_list *list);
+EdgeFirstDetectBoxList *edgefirst_detect_box_list_new (const ef_detect_box *boxes,
+                                                       guint               n_boxes);
 
 /**
  * edgefirst_detect_box_list_new_normalized:
- * @list: (transfer full): HAL detect box list to wrap (takes ownership)
+ * @boxes: (array length=n_boxes) (nullable): HAL detections, copied
+ * @n_boxes: number of entries in @boxes
  * @normalized: TRUE if HAL coordinates are already [0,1]
  * @model_w: model input width (used when @normalized is FALSE)
  * @model_h: model input height (used when @normalized is FALSE)
  *
- * Returns: (transfer full): a new #EdgeFirstDetectBoxList
+ * Returns: (transfer full) (nullable): a new #EdgeFirstDetectBoxList, or
+ *   NULL when @boxes is NULL and @n_boxes is not zero
  */
 EdgeFirstDetectBoxList *edgefirst_detect_box_list_new_normalized (
-    hal_detect_box_list *list,
-    gboolean normalized,
-    guint model_w,
-    guint model_h);
+    const ef_detect_box *boxes,
+    guint                n_boxes,
+    gboolean             normalized,
+    guint                model_w,
+    guint                model_h);
 
 /**
  * edgefirst_detect_box_list_get_length:
@@ -119,11 +127,22 @@ G_DECLARE_FINAL_TYPE (EdgeFirstSegmentationList, edgefirst_segmentation_list,
 
 /**
  * edgefirst_segmentation_list_new:
- * @list: (transfer full): HAL segmentation list to wrap (takes ownership)
+ * @segs: (array length=n_segs) (nullable): HAL segmentations, borrowed
+ * @n_segs: number of entries in @segs
+ * @owner: (nullable): owner of @segs and of the mask bytes they point to
+ * @owner_free: (nullable): releases @owner when the list is finalized
  *
- * Returns: (transfer full): a new #EdgeFirstSegmentationList
+ * Wraps @segs without copying them. @segs and every mask it points to must
+ * stay valid until @owner_free is called on @owner.
+ *
+ * Returns: (transfer full) (nullable): a new #EdgeFirstSegmentationList, or
+ *   NULL when @segs is NULL and @n_segs is not zero
  */
-EdgeFirstSegmentationList *edgefirst_segmentation_list_new (hal_segmentation_list *list);
+EdgeFirstSegmentationList *edgefirst_segmentation_list_new (
+    const ef_segmentation *segs,
+    guint                  n_segs,
+    gpointer               owner,
+    GDestroyNotify         owner_free);
 
 /**
  * edgefirst_segmentation_list_get_length:
@@ -144,22 +163,28 @@ EdgeFirstSegmentation *edgefirst_segmentation_list_get (EdgeFirstSegmentationLis
                                                          guint                      index);
 
 /**
- * edgefirst_detect_box_list_get_hal:
- * @self: a #EdgeFirstDetectBoxList (may be NULL)
+ * edgefirst_detect_box_list_get_data:
+ * @self: (nullable): a #EdgeFirstDetectBoxList
+ * @n_boxes: (out): number of boxes
  *
- * Returns the underlying #hal_detect_box_list pointer.  The returned pointer
- * is owned by @self — do not free it.
+ * The detections as HAL reported them, before any normalization.
+ *
+ * Returns: (array length=n_boxes) (transfer none) (nullable): the boxes,
+ *   owned by @self, or NULL when @self is NULL or empty
  */
-hal_detect_box_list *edgefirst_detect_box_list_get_hal (EdgeFirstDetectBoxList *self);
+const ef_detect_box *edgefirst_detect_box_list_get_data (EdgeFirstDetectBoxList *self,
+                                                          guint                  *n_boxes);
 
 /**
- * edgefirst_segmentation_list_get_hal:
- * @self: a #EdgeFirstSegmentationList (may be NULL)
+ * edgefirst_segmentation_list_get_data:
+ * @self: (nullable): a #EdgeFirstSegmentationList
+ * @n_segs: (out): number of segmentations
  *
- * Returns the underlying #hal_segmentation_list pointer.  The returned pointer
- * is owned by @self — do not free it.
+ * Returns: (array length=n_segs) (transfer none) (nullable): the
+ *   segmentations, owned by @self, or NULL when @self is NULL or empty
  */
-hal_segmentation_list *edgefirst_segmentation_list_get_hal (EdgeFirstSegmentationList *self);
+const ef_segmentation *edgefirst_segmentation_list_get_data (EdgeFirstSegmentationList *self,
+                                                              guint                     *n_segs);
 
 /* ── EdgeFirstColorMode ──────────────────────────────────────────── */
 

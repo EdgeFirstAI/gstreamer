@@ -228,10 +228,10 @@ components = [
         "type": "library",
         "bom-ref": "edgefirst-hal",
         "name": "edgefirst-hal",
-        "version": "0.3",
-        "description": "EdgeFirst hardware abstraction layer",
+        "version": "0.34",
+        "description": "EdgeFirst HAL C libraries (tensor, image, decoder)",
         "licenses": [{"license": {"id": "Apache-2.0"}}],
-        "purl": "pkg:generic/edgefirst-hal@0.3"
+        "purl": "pkg:generic/edgefirst-hal@0.34"
     },
     {
         "type": "library",
