@@ -122,7 +122,7 @@ The framework consists of four libraries:
 | `libedgefirst-gstreamer-1.0.so` | Shared library | Caps definitions, GstMeta types, utilities | GStreamer, GLib |
 | `libgstedgefirst-zenoh.so` | Plugin | Zenoh subscriber/publisher | Core, zenoh-c, edgefirst-schemas |
 | `libgstedgefirst-fusion.so` | Plugin | Point cloud classification, calibration injection | Core, json-glib |
-| `libgstedgefirsthal.so` | Plugin | Hardware-accelerated ML preprocessing | Core, edgefirst-hal |
+| `libgstedgefirsthal.so` | Plugin | Hardware-accelerated ML preprocessing | Core, edgefirst-image, edgefirst-decoder |
 
 ### 2.3 Data Flow Patterns
 
@@ -444,7 +444,16 @@ for CHW layout, dimensions are `"W:H:C:1"`.
 
 **Letterbox:** When `letterbox=true`, the source image is scaled to fit the
 target dimensions while preserving aspect ratio. Padding regions are filled
-with `fill-color`. The crop geometry is computed once per caps change.
+with `fill-color`. The crop geometry is computed once per caps change. The
+centred placement uses HAL's own letterbox; a placement moved by the
+`letterbox-top/bottom/left/right` overrides is converted into a view of the
+output (packed formats) or of a packed staging image that is then converted
+to the planar output, with the padding filled once per output buffer.
+
+**Pixel formats:** `gst/hal/edgefirsthalutils.c` holds the single table that
+maps GStreamer video formats to HAL pixel format wire names (`"rgb8"`,
+`"NV12"`, ...). It decides which input formats the element accepts, and the
+`hal_elements` tests check every row against the linked HAL.
 
 #### 4.5.2 DMA-BUF Zero-Copy
 
@@ -768,7 +777,7 @@ edgefirst-gstreamer/
 | zenoh-c | `zenoh` | Zenoh bridge plugin |
 | edgefirst-schemas | `zenoh` | CDR serialization/deserialization |
 | json-glib-1.0 | `fusion` | Calibration file parsing |
-| edgefirst-hal | `hal` | Hardware-accelerated image processing |
+| EdgeFirst HAL C libraries (edgefirst-image, edgefirst-decoder, edgefirst-decoder-abi) >= 0.34.1 | `hal` | Hardware-accelerated image processing, model output decoding, detection types |
 | NNStreamer | -- | Tensor infrastructure (runtime, not build dep) |
 
 ### 9.3 Build Options

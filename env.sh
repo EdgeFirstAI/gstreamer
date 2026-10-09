@@ -3,9 +3,9 @@
 #
 # Usage: source env.sh
 #
-# Downloads and extracts pre-compiled zenoh-c and edgefirst-schemas
-# libraries for the host architecture, then sets PKG_CONFIG_PATH and
-# LD_LIBRARY_PATH so that meson can find them.
+# Downloads and extracts pre-compiled zenoh-c, edgefirst-schemas and
+# EdgeFirst HAL C libraries for the host architecture, then sets
+# PKG_CONFIG_PATH and LD_LIBRARY_PATH so that meson can find them.
 
 set -e
 
@@ -14,7 +14,7 @@ DEPS_DIR="$SCRIPT_DIR/deps/host"
 
 ZENOH_C_VERSION="1.7.2"
 SCHEMAS_VERSION="1.5.3"
-HAL_VERSION="0.6.2"
+HAL_VERSION="0.34.1"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -34,7 +34,7 @@ esac
 
 ZENOH_C_ARCHIVE="zenoh-c-${ZENOH_C_VERSION}-${ZENOH_C_TRIPLE}-standalone.zip"
 SCHEMAS_ARCHIVE="edgefirst-schemas-${SCHEMAS_PLATFORM}-${SCHEMAS_VERSION}.zip"
-HAL_ARCHIVE="edgefirst-hal-capi-${HAL_VERSION}-${ARCH}-linux.tar.gz"
+HAL_ARCHIVE="edgefirst-hal-${HAL_VERSION}-${ARCH}-linux.tar.gz"
 
 ZENOH_C_URL="https://github.com/eclipse-zenoh/zenoh-c/releases/download/${ZENOH_C_VERSION}/${ZENOH_C_ARCHIVE}"
 SCHEMAS_URL="https://github.com/EdgeFirstAI/schemas/releases/download/v${SCHEMAS_VERSION}/${SCHEMAS_ARCHIVE}"
@@ -42,7 +42,7 @@ HAL_URL="https://github.com/EdgeFirstAI/hal/releases/download/v${HAL_VERSION}/${
 
 ZENOH_C_DIR="$DEPS_DIR/zenoh-c"
 SCHEMAS_DIR="$DEPS_DIR/edgefirst-schemas"
-HAL_DIR="$DEPS_DIR/edgefirst-hal"
+HAL_DIR="$DEPS_DIR/edgefirst-hal-${HAL_VERSION}"
 
 # --- zenoh-c ---
 if [ ! -f "$ZENOH_C_DIR/lib/libzenohc.so" ]; then
@@ -84,28 +84,14 @@ PCEOF
 fi
 
 # --- edgefirst-hal ---
-if [ ! -f "$HAL_DIR/lib/libedgefirst_hal.so" ]; then
+# The archive ships relocatable pkg-config files for edgefirst-tensor,
+# edgefirst-image, edgefirst-decoder and edgefirst-decoder-abi.
+if [[ ! -f "$HAL_DIR/lib/libedgefirst_image.so" ]]; then
   mkdir -p "$HAL_DIR"
   echo "Downloading edgefirst-hal ${HAL_VERSION} (${ARCH})..."
-  curl -sL "$HAL_URL" -o "/tmp/${HAL_ARCHIVE}"
   # Archive has a top-level directory; strip it
-  tar xzf "/tmp/${HAL_ARCHIVE}" -C "/tmp"
-  cp -a "/tmp/edgefirst-hal-capi-${HAL_VERSION}-${ARCH}-linux"/. "$HAL_DIR/"
-  rm -rf "/tmp/${HAL_ARCHIVE}" "/tmp/edgefirst-hal-capi-${HAL_VERSION}-${ARCH}-linux"
-
-  # Generate pkg-config file
-  mkdir -p "$HAL_DIR/lib/pkgconfig"
-  cat > "$HAL_DIR/lib/pkgconfig/edgefirst-hal.pc" <<PCEOF
-prefix=${HAL_DIR}
-libdir=\${prefix}/lib
-includedir=\${prefix}/include
-
-Name: edgefirst-hal
-Description: EdgeFirst Hardware Abstraction Layer C API
-Version: ${HAL_VERSION}
-Cflags: -I\${includedir}
-Libs: -L\${libdir} -ledgefirst_hal
-PCEOF
+  curl -sfL --proto '=https' --tlsv1.2 "$HAL_URL" \
+    | tar xz --strip-components=1 -C "$HAL_DIR"
   echo "  -> ${HAL_DIR}"
 fi
 
