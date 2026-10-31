@@ -56,7 +56,7 @@ flowchart LR
 | Zenoh-C | latest | Zenoh plugin only |
 | edgefirst-schemas | >= 1.5 | Zenoh plugin only |
 | json-glib-1.0 | >= 1.0 | Fusion plugin only |
-| edgefirst-hal | >= 0.6 | HAL plugin only |
+| EdgeFirst HAL C libraries (edgefirst-image, edgefirst-decoder) | >= 0.34.1 | HAL plugin and detection types |
 | NNStreamer | >= 2.0 | Optional (radar tensor support) |
 
 ## Environment Setup

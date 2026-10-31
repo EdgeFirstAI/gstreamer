@@ -13,6 +13,7 @@
 /* NEON header removed — HAL 0.12.0 handles all post-processing */
 #include <gst/edgefirst/edgefirstdetection.h>
 #include "../../gst/hal/edgefirstcameraadaptor.h"
+#include "../../gst/hal/edgefirsthalutils.h"
 
 /* ── TCase "Creation" ──────────────────────────────────────────────── */
 
@@ -595,6 +596,185 @@ GST_START_TEST (test_camera_adaptor_letterbox_properties)
   gst_object_unref (adaptor);
   gst_object_unref (sink);
   gst_object_unref (pipeline);
+}
+GST_END_TEST;
+
+/* ── TCase "Letterbox" ────────────────────────────────────────────── */
+
+/* Pull one 320x320 frame letterboxed from a white 640x480 RGB source. */
+static GstBuffer *
+pull_letterboxed_white (const gchar *extra_props)
+{
+  gchar *pipeline_str = g_strdup_printf (
+      "videotestsrc num-buffers=1 pattern=white ! "
+      "video/x-raw,format=RGB,width=640,height=480 ! "
+      "edgefirstcameraadaptor model-width=320 model-height=320 "
+        "letterbox=true %s ! "
+      "appsink name=sink", extra_props);
+  GstBuffer *buf = run_pipeline_pull_buffer (pipeline_str);
+  g_free (pipeline_str);
+  fail_unless (buf != NULL, "no letterboxed frame for \"%s\"", extra_props);
+  return buf;
+}
+
+static void
+assert_hwc_pixel (const GstMapInfo *map, guint x, guint y,
+    guint8 r, guint8 g, guint8 b)
+{
+  const guint8 *p = map->data + ((gsize) y * 320 + x) * 3;
+  fail_unless (p[0] == r && p[1] == g && p[2] == b,
+      "pixel (%u,%u) = (%u,%u,%u), expected (%u,%u,%u)",
+      x, y, p[0], p[1], p[2], r, g, b);
+}
+
+GST_START_TEST (test_camera_adaptor_letterbox_fill)
+{
+  /* Centred placement: 320x240 image with 40-row bands of fill colour */
+  GstBuffer *buf = pull_letterboxed_white ("fill-color=0x102030ff");
+  GstMapInfo map;
+  fail_unless (gst_buffer_map (buf, &map, GST_MAP_READ));
+  fail_unless_equals_uint64 (map.size, 320 * 320 * 3);
+  assert_hwc_pixel (&map, 0, 0, 0x10, 0x20, 0x30);
+  assert_hwc_pixel (&map, 319, 39, 0x10, 0x20, 0x30);
+  assert_hwc_pixel (&map, 0, 40, 255, 255, 255);
+  assert_hwc_pixel (&map, 160, 160, 255, 255, 255);
+  assert_hwc_pixel (&map, 319, 279, 255, 255, 255);
+  assert_hwc_pixel (&map, 0, 280, 0x10, 0x20, 0x30);
+  assert_hwc_pixel (&map, 319, 319, 0x10, 0x20, 0x30);
+  gst_buffer_unmap (buf, &map);
+  gst_buffer_unref (buf);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_camera_adaptor_letterbox_override)
+{
+  /* letterbox-top=0 moves the image to the top and the padding below it */
+  GstBuffer *buf = pull_letterboxed_white ("letterbox-top=0");
+  GstMapInfo map;
+  fail_unless (gst_buffer_map (buf, &map, GST_MAP_READ));
+  fail_unless_equals_uint64 (map.size, 320 * 320 * 3);
+  assert_hwc_pixel (&map, 0, 0, 255, 255, 255);
+  assert_hwc_pixel (&map, 319, 239, 255, 255, 255);
+  assert_hwc_pixel (&map, 0, 240, 0x80, 0x80, 0x80);
+  assert_hwc_pixel (&map, 319, 319, 0x80, 0x80, 0x80);
+  gst_buffer_unmap (buf, &map);
+  gst_buffer_unref (buf);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_camera_adaptor_letterbox_override_chw_int8)
+{
+  /* Planar int8 output with a non-centred placement: white is 255 ^ 0x80
+   * and the default grey fill 0x80 ^ 0x80 in every channel plane. */
+  GstBuffer *buf = pull_letterboxed_white (
+      "letterbox-top=0 model-layout=chw model-dtype=int8");
+  GstMapInfo map;
+  fail_unless (gst_buffer_map (buf, &map, GST_MAP_READ));
+  fail_unless_equals_uint64 (map.size, 3 * 320 * 320);
+  for (guint c = 0; c < 3; c++) {
+    const guint8 *plane = map.data + (gsize) c * 320 * 320;
+    fail_unless_equals_int (plane[0], 0x7f);
+    fail_unless_equals_int (plane[239 * 320 + 319], 0x7f);
+    fail_unless_equals_int (plane[240 * 320], 0x00);
+    fail_unless_equals_int (plane[319 * 320 + 319], 0x00);
+  }
+  gst_buffer_unmap (buf, &map);
+  gst_buffer_unref (buf);
+}
+GST_END_TEST;
+
+/* ── TCase "HalFormats" ───────────────────────────────────────────── */
+
+GST_START_TEST (test_hal_format_table)
+{
+  /* Every wire name in the format table is one HAL recognises, and HAL
+   * allocates it with the shape the table predicts. */
+  const guint width = 6;
+  const guint height = 5;
+  guint rows = 0;
+  for (const EdgefirstHalFormat *f = edgefirst_hal_formats (); f->wire; f++) {
+    rows++;
+    ef_tensor *t = ef_tensor_image_alloc (width, height, f->wire, EF_DTYPE_U8,
+        1, EF_STORAGE_KIND_MEM, EF_CPU_ACCESS_READ_WRITE);
+    fail_unless (t != NULL, "HAL refused format \"%s\": %s", f->wire,
+        ef_tensor_last_error_message ());
+    fail_unless_equals_string (ef_tensor_format (t), f->wire);
+
+    guint64 shape[3];
+    guint ndim = edgefirst_hal_format_shape (f, width, height, shape);
+    fail_unless_equals_int (ef_tensor_ndim (t), ndim);
+    const uint64_t *hal_shape = ef_tensor_shape (t);
+    for (guint i = 0; i < ndim; i++)
+      fail_unless (hal_shape[i] == shape[i], "%s: dim %u is %" G_GUINT64_FORMAT
+          ", table says %" G_GUINT64_FORMAT, f->wire, i,
+          (guint64) hal_shape[i], shape[i]);
+
+    if (f->gst != GST_VIDEO_FORMAT_UNKNOWN) {
+      fail_unless (edgefirst_hal_format_from_gst (f->gst) == f);
+      const GstVideoFormatInfo *vi = gst_video_format_get_info (f->gst);
+      fail_unless_equals_int (GST_VIDEO_FORMAT_INFO_N_PLANES (vi),
+          f->layout == EDGEFIRST_HAL_LAYOUT_SEMI_PLANAR ? 2 : 1);
+    }
+    fail_unless (edgefirst_hal_format_from_wire (f->wire) == f);
+    ef_tensor_free (t);
+  }
+  fail_unless (rows > 0);
+  fail_unless (edgefirst_hal_format_from_gst (GST_VIDEO_FORMAT_I420) == NULL);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_detection_lists)
+{
+  const ef_detect_box boxes[2] = {
+    { .xmin = 64.0f, .ymin = 32.0f, .xmax = 128.0f, .ymax = 96.0f,
+      .score = 0.9f, .label = 3 },
+    { .xmin = 0.0f, .ymin = 0.0f, .xmax = 640.0f, .ymax = 640.0f,
+      .score = 0.5f, .label = 7 },
+  };
+  EdgeFirstDetectBoxList *list =
+      edgefirst_detect_box_list_new_normalized (boxes, 2, FALSE, 640, 640);
+  fail_unless (list != NULL);
+  fail_unless_equals_int (edgefirst_detect_box_list_get_length (list), 2);
+
+  EdgeFirstDetectBox *b = edgefirst_detect_box_list_get (list, 0);
+  fail_unless (b != NULL);
+  fail_unless (fabsf (b->x1 - 0.1f) < 1e-6f && fabsf (b->y2 - 0.15f) < 1e-6f);
+  fail_unless_equals_int (b->class_id, 3);
+  fail_unless_equals_int64 (b->track_id, -1);
+  edgefirst_detect_box_free (b);
+  fail_unless (edgefirst_detect_box_list_get (list, 2) == NULL);
+
+  guint n = 0;
+  const ef_detect_box *raw = edgefirst_detect_box_list_get_data (list, &n);
+  fail_unless_equals_int (n, 2);
+  fail_unless (raw[1].xmax == 640.0f && raw[1].label == 7);
+  g_object_unref (list);
+
+  EdgeFirstDetectBoxList *empty = edgefirst_detect_box_list_new (NULL, 0);
+  fail_unless (empty != NULL);
+  fail_unless_equals_int (edgefirst_detect_box_list_get_length (empty), 0);
+  fail_unless (edgefirst_detect_box_list_get_data (empty, &n) == NULL && n == 0);
+  g_object_unref (empty);
+
+  /* Segmentations are borrowed until the list releases their owner */
+  static const guint8 mask[6] = { 0, 255, 128, 64, 32, 16 };
+  ef_segmentation *segs = g_new0 (ef_segmentation, 1);
+  segs[0] = (ef_segmentation) { .xmin = 0.1f, .ymin = 0.2f, .xmax = 0.3f,
+    .ymax = 0.4f, .mask = mask, .width = 3, .height = 2 };
+  EdgeFirstSegmentationList *seg_list =
+      edgefirst_segmentation_list_new (segs, 1, segs, g_free);
+  fail_unless_equals_int (edgefirst_segmentation_list_get_length (seg_list), 1);
+  EdgeFirstSegmentation *seg = edgefirst_segmentation_list_get (seg_list, 0);
+  fail_unless (seg != NULL);
+  fail_unless_equals_int (seg->width, 3);
+  fail_unless_equals_int (seg->height, 2);
+  gsize sz = 0;
+  const guint8 *bytes = g_bytes_get_data (seg->mask, &sz);
+  fail_unless (sz == 6 && bytes[1] == 255 && bytes[5] == 16);
+  g_object_unref (seg_list);
+  /* The copy outlives the list */
+  fail_unless (g_bytes_get_size (seg->mask) == 6);
+  edgefirst_segmentation_free (seg);
 }
 GST_END_TEST;
 
@@ -1186,10 +1366,12 @@ GST_END_TEST;
 
 GST_START_TEST (test_overlay_segmentation_independence)
 {
-  /* edgefirst_detect_box_list_new(NULL) returns NULL — guarded in new() */
-  EdgeFirstDetectBoxList *box_list = edgefirst_detect_box_list_new (NULL);
+  /* A NULL array with a non-zero count is refused */
+  EdgeFirstDetectBoxList *box_list = edgefirst_detect_box_list_new (NULL, 1);
   fail_unless (box_list == NULL,
-      "edgefirst_detect_box_list_new(NULL) should return NULL");
+      "edgefirst_detect_box_list_new(NULL, 1) should return NULL");
+  fail_unless (edgefirst_segmentation_list_new (NULL, 1, NULL, NULL) == NULL,
+      "edgefirst_segmentation_list_new(NULL, 1) should return NULL");
 
   /* Verify EdgeFirstSegmentation copy is independent of original */
   EdgeFirstSegmentation *seg = g_slice_new (EdgeFirstSegmentation);
@@ -1251,7 +1433,7 @@ edgefirst_hal_elements_suite (void)
   tcase_add_test (tc_pipeline, test_camera_adaptor_int8);
   tcase_add_test (tc_pipeline, test_camera_adaptor_chw_layout);
   /* float32 disabled: HAL does not yet support float32 output in
-   * hal_image_processor_convert (returns -1). Re-enable when HAL adds
+   * ef_image_processor_convert (returns -1). Re-enable when HAL adds
    * float normalization and model-mean/model-std are wired in. */
   /* tcase_add_test (tc_pipeline, test_camera_adaptor_float32); */
   suite_add_tcase (s, tc_pipeline);
@@ -1261,10 +1443,14 @@ edgefirst_hal_elements_suite (void)
   tcase_add_test (tc_content, test_camera_adaptor_chw_int8);
   tcase_add_test (tc_content, test_camera_adaptor_bgr_hwc);
   tcase_add_test (tc_content, test_camera_adaptor_letterbox_properties);
+  tcase_add_test (tc_content, test_camera_adaptor_letterbox_fill);
+  tcase_add_test (tc_content, test_camera_adaptor_letterbox_override);
+  tcase_add_test (tc_content, test_camera_adaptor_letterbox_override_chw_int8);
   suite_add_tcase (s, tc_content);
 
   TCase *tc_formats = tcase_create ("FormatConversion");
   tcase_set_timeout (tc_formats, 60);  /* format iteration needs more time */
+  tcase_add_test (tc_formats, test_hal_format_table);
   tcase_add_test (tc_formats, test_format_conversion_all_formats);
   tcase_add_test (tc_formats, test_format_timing);
   suite_add_tcase (s, tc_formats);
@@ -1278,6 +1464,7 @@ edgefirst_hal_elements_suite (void)
   tcase_add_test (tc_overlay_el, test_overlay_auto_config_detect);
   tcase_add_test (tc_overlay_el, test_overlay_auto_config_seg);
   tcase_add_test (tc_overlay_el, test_overlay_segmentation_independence);
+  tcase_add_test (tc_overlay_el, test_detection_lists);
   suite_add_tcase (s, tc_overlay_el);
 
   TCase *tc_overlay_pipeline = tcase_create ("OverlayPipeline");

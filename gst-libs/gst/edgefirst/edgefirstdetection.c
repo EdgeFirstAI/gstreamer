@@ -31,7 +31,7 @@ G_DEFINE_BOXED_TYPE (EdgeFirstDetectBox, edgefirst_detect_box,
 
 struct _EdgeFirstDetectBoxList {
   GObject parent;
-  hal_detect_box_list *list;  /* owned */
+  GArray *boxes;         /* ef_detect_box, as HAL reported them */
   gboolean normalized;   /* TRUE = coords already [0,1] */
   guint model_w;         /* model input width for pixel→normalized scaling */
   guint model_h;
@@ -43,7 +43,7 @@ static void
 edgefirst_detect_box_list_finalize (GObject *object)
 {
   EdgeFirstDetectBoxList *self = EDGEFIRST_DETECT_BOX_LIST (object);
-  hal_detect_box_list_free (self->list);
+  g_array_unref (self->boxes);
   G_OBJECT_CLASS (edgefirst_detect_box_list_parent_class)->finalize (object);
 }
 
@@ -57,27 +57,28 @@ edgefirst_detect_box_list_class_init (EdgeFirstDetectBoxListClass *klass)
 static void
 edgefirst_detect_box_list_init (EdgeFirstDetectBoxList *self)
 {
-  self->list       = NULL;
+  self->boxes      = g_array_new (FALSE, FALSE, sizeof (ef_detect_box));
   self->normalized = TRUE;
   self->model_w    = 0;
   self->model_h    = 0;
 }
 
 EdgeFirstDetectBoxList *
-edgefirst_detect_box_list_new (hal_detect_box_list *list)
+edgefirst_detect_box_list_new (const ef_detect_box *boxes, guint n_boxes)
 {
-  return edgefirst_detect_box_list_new_normalized (list, TRUE, 0, 0);
+  return edgefirst_detect_box_list_new_normalized (boxes, n_boxes, TRUE, 0, 0);
 }
 
 EdgeFirstDetectBoxList *
-edgefirst_detect_box_list_new_normalized (hal_detect_box_list *list,
-    gboolean normalized, guint model_w, guint model_h)
+edgefirst_detect_box_list_new_normalized (const ef_detect_box *boxes,
+    guint n_boxes, gboolean normalized, guint model_w, guint model_h)
 {
-  if (!list)
+  if (!boxes && n_boxes > 0)
     return NULL;
   EdgeFirstDetectBoxList *self =
       g_object_new (EDGEFIRST_TYPE_DETECT_BOX_LIST, NULL);
-  self->list       = list;
+  if (n_boxes > 0)
+    g_array_append_vals (self->boxes, boxes, n_boxes);
   self->normalized = normalized;
   self->model_w    = model_w;
   self->model_h    = model_h;
@@ -88,33 +89,32 @@ guint
 edgefirst_detect_box_list_get_length (EdgeFirstDetectBoxList *self)
 {
   g_return_val_if_fail (EDGEFIRST_IS_DETECT_BOX_LIST (self), 0);
-  return (guint) hal_detect_box_list_len (self->list);
+  return self->boxes->len;
 }
 
 EdgeFirstDetectBox *
 edgefirst_detect_box_list_get (EdgeFirstDetectBoxList *self, guint index)
 {
-  struct hal_detect_box hbox;
-
   g_return_val_if_fail (EDGEFIRST_IS_DETECT_BOX_LIST (self), NULL);
 
-  if (hal_detect_box_list_get (self->list, (size_t) index, &hbox) != 0)
+  if (index >= self->boxes->len)
     return NULL;
+  const ef_detect_box *hbox = &g_array_index (self->boxes, ef_detect_box, index);
 
   EdgeFirstDetectBox *box = g_slice_new (EdgeFirstDetectBox);
   if (self->normalized || self->model_w == 0 || self->model_h == 0) {
-    box->x1 = hbox.xmin;
-    box->y1 = hbox.ymin;
-    box->x2 = hbox.xmax;
-    box->y2 = hbox.ymax;
+    box->x1 = hbox->xmin;
+    box->y1 = hbox->ymin;
+    box->x2 = hbox->xmax;
+    box->y2 = hbox->ymax;
   } else {
-    box->x1 = hbox.xmin / (gfloat) self->model_w;
-    box->y1 = hbox.ymin / (gfloat) self->model_h;
-    box->x2 = hbox.xmax / (gfloat) self->model_w;
-    box->y2 = hbox.ymax / (gfloat) self->model_h;
+    box->x1 = hbox->xmin / (gfloat) self->model_w;
+    box->y1 = hbox->ymin / (gfloat) self->model_h;
+    box->x2 = hbox->xmax / (gfloat) self->model_w;
+    box->y2 = hbox->ymax / (gfloat) self->model_h;
   }
-  box->class_id = (gint) hbox.label;
-  box->score    = hbox.score;
+  box->class_id = (gint) hbox->label;
+  box->score    = hbox->score;
   box->track_id = -1;  /* track_id populated when tracking is enabled */
   return box;
 }
@@ -146,7 +146,10 @@ G_DEFINE_BOXED_TYPE (EdgeFirstSegmentation, edgefirst_segmentation,
 
 struct _EdgeFirstSegmentationList {
   GObject parent;
-  hal_segmentation_list *list;  /* owned */
+  const ef_segmentation *segs;  /* borrowed from owner */
+  guint n_segs;
+  gpointer owner;
+  GDestroyNotify owner_free;
 };
 
 G_DEFINE_FINAL_TYPE (EdgeFirstSegmentationList, edgefirst_segmentation_list, G_TYPE_OBJECT)
@@ -155,7 +158,8 @@ static void
 edgefirst_segmentation_list_finalize (GObject *object)
 {
   EdgeFirstSegmentationList *self = EDGEFIRST_SEGMENTATION_LIST (object);
-  hal_segmentation_list_free (self->list);
+  if (self->owner_free && self->owner)
+    self->owner_free (self->owner);
   G_OBJECT_CLASS (edgefirst_segmentation_list_parent_class)->finalize (object);
 }
 
@@ -169,16 +173,24 @@ edgefirst_segmentation_list_class_init (EdgeFirstSegmentationListClass *klass)
 static void
 edgefirst_segmentation_list_init (EdgeFirstSegmentationList *self)
 {
-  self->list = NULL;
+  self->segs       = NULL;
+  self->n_segs     = 0;
+  self->owner      = NULL;
+  self->owner_free = NULL;
 }
 
 EdgeFirstSegmentationList *
-edgefirst_segmentation_list_new (hal_segmentation_list *list)
+edgefirst_segmentation_list_new (const ef_segmentation *segs, guint n_segs,
+    gpointer owner, GDestroyNotify owner_free)
 {
-  g_return_val_if_fail (list != NULL, NULL);
+  if (!segs && n_segs > 0)
+    return NULL;
   EdgeFirstSegmentationList *self =
       g_object_new (EDGEFIRST_TYPE_SEGMENTATION_LIST, NULL);
-  self->list = list;
+  self->segs       = n_segs > 0 ? segs : NULL;
+  self->n_segs     = n_segs;
+  self->owner      = owner;
+  self->owner_free = owner_free;
   return self;
 }
 
@@ -186,50 +198,56 @@ guint
 edgefirst_segmentation_list_get_length (EdgeFirstSegmentationList *self)
 {
   g_return_val_if_fail (EDGEFIRST_IS_SEGMENTATION_LIST (self), 0);
-  return (guint) hal_segmentation_list_len (self->list);
+  return self->n_segs;
 }
 
 EdgeFirstSegmentation *
 edgefirst_segmentation_list_get (EdgeFirstSegmentationList *self, guint index)
 {
-  size_t out_h = 0, out_w = 0;
-  float xmin, ymin, xmax, ymax;
-
   g_return_val_if_fail (EDGEFIRST_IS_SEGMENTATION_LIST (self), NULL);
 
-  const uint8_t *data = hal_segmentation_list_get_mask (self->list,
-      (size_t) index, &out_h, &out_w);
-  if (!data)
+  if (index >= self->n_segs)
     return NULL;
-
-  if (hal_segmentation_list_get_bbox (self->list, (size_t) index,
-          &xmin, &ymin, &xmax, &ymax) != 0)
+  const ef_segmentation *hseg = &self->segs[index];
+  if (!hseg->mask)
     return NULL;
 
   /* Deep-copy mask bytes into GBytes so this struct is lifetime-independent */
-  GBytes *mask = g_bytes_new (data, out_h * out_w);
+  GBytes *mask = g_bytes_new (hseg->mask, (gsize) hseg->height * hseg->width);
 
   EdgeFirstSegmentation *seg = g_slice_new (EdgeFirstSegmentation);
-  seg->x1     = xmin;
-  seg->y1     = ymin;
-  seg->x2     = xmax;
-  seg->y2     = ymax;
-  seg->width  = (guint) out_w;
-  seg->height = (guint) out_h;
+  seg->x1     = hseg->xmin;
+  seg->y1     = hseg->ymin;
+  seg->x2     = hseg->xmax;
+  seg->y2     = hseg->ymax;
+  seg->width  = hseg->width;
+  seg->height = hseg->height;
   seg->mask   = mask;
   return seg;
 }
 
-hal_detect_box_list *
-edgefirst_detect_box_list_get_hal (EdgeFirstDetectBoxList *self)
+const ef_detect_box *
+edgefirst_detect_box_list_get_data (EdgeFirstDetectBoxList *self,
+    guint *n_boxes)
 {
-  return self ? self->list : NULL;
+  if (!self || self->boxes->len == 0) {
+    *n_boxes = 0;
+    return NULL;
+  }
+  *n_boxes = self->boxes->len;
+  return (const ef_detect_box *) self->boxes->data;
 }
 
-hal_segmentation_list *
-edgefirst_segmentation_list_get_hal (EdgeFirstSegmentationList *self)
+const ef_segmentation *
+edgefirst_segmentation_list_get_data (EdgeFirstSegmentationList *self,
+    guint *n_segs)
 {
-  return self ? self->list : NULL;
+  if (!self || self->n_segs == 0) {
+    *n_segs = 0;
+    return NULL;
+  }
+  *n_segs = self->n_segs;
+  return self->segs;
 }
 
 /* ── EdgeFirstColorMode (GEnum) ──────────────────────────────────── */

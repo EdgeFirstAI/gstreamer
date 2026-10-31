@@ -20,7 +20,7 @@
 
 #include <gst/video/video.h>
 #include <gst/allocators/gstdmabuf.h>
-#include <edgefirst/hal.h>
+#include "edgefirsthalutils.h"
 #include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -31,30 +31,30 @@ GST_DEBUG_CATEGORY_STATIC (edgefirst_hal_debug);
 /* ── HAL log → GST_DEBUG bridge ──────────────────────────────────── */
 
 static void
-hal_log_to_gst (enum hal_log_level level, const char *target,
+hal_log_to_gst (ef_log_level level, const char *target,
     const char *message, void *userdata G_GNUC_UNUSED)
 {
   GstDebugLevel gst_level;
   switch (level) {
-    case HAL_LOG_LEVEL_ERROR: gst_level = GST_LEVEL_ERROR; break;
-    case HAL_LOG_LEVEL_WARN:  gst_level = GST_LEVEL_WARNING; break;
-    case HAL_LOG_LEVEL_INFO:  gst_level = GST_LEVEL_INFO; break;
-    case HAL_LOG_LEVEL_DEBUG: gst_level = GST_LEVEL_DEBUG; break;
-    case HAL_LOG_LEVEL_TRACE: gst_level = GST_LEVEL_TRACE; break;
-    default:                  gst_level = GST_LEVEL_LOG; break;
+    case EF_LOG_LEVEL_ERROR: gst_level = GST_LEVEL_ERROR; break;
+    case EF_LOG_LEVEL_WARN:  gst_level = GST_LEVEL_WARNING; break;
+    case EF_LOG_LEVEL_INFO:  gst_level = GST_LEVEL_INFO; break;
+    case EF_LOG_LEVEL_DEBUG: gst_level = GST_LEVEL_DEBUG; break;
+    case EF_LOG_LEVEL_TRACE: gst_level = GST_LEVEL_TRACE; break;
+    default:                 gst_level = GST_LEVEL_LOG; break;
   }
   gst_debug_log (edgefirst_hal_debug, gst_level, target, "", 0, NULL,
       "%s", message);
 }
 
-static enum hal_log_level
+static ef_log_level
 gst_level_to_hal (GstDebugLevel gst_level)
 {
-  if (gst_level <= GST_LEVEL_ERROR)   return HAL_LOG_LEVEL_ERROR;
-  if (gst_level <= GST_LEVEL_WARNING) return HAL_LOG_LEVEL_WARN;
-  if (gst_level <= GST_LEVEL_INFO)    return HAL_LOG_LEVEL_INFO;
-  if (gst_level <= GST_LEVEL_DEBUG)   return HAL_LOG_LEVEL_DEBUG;
-  return HAL_LOG_LEVEL_TRACE;
+  if (gst_level <= GST_LEVEL_ERROR)   return EF_LOG_LEVEL_ERROR;
+  if (gst_level <= GST_LEVEL_WARNING) return EF_LOG_LEVEL_WARN;
+  if (gst_level <= GST_LEVEL_INFO)    return EF_LOG_LEVEL_INFO;
+  if (gst_level <= GST_LEVEL_DEBUG)   return EF_LOG_LEVEL_DEBUG;
+  return EF_LOG_LEVEL_TRACE;
 }
 
 /* Monotonic clock for pipeline timing */
@@ -170,6 +170,17 @@ enum {
 
 /* ── Instance struct ─────────────────────────────────────────────── */
 
+/* How the letterbox placement reaches HAL. HAL letterboxes natively only
+ * into the centred rectangle it computes itself; any other placement is a
+ * convert into a view of the output, which HAL offers for packed formats
+ * only, so a planar output is staged through a packed image. */
+typedef enum {
+  LETTERBOX_NONE,     /* stretch to the whole output */
+  LETTERBOX_NATIVE,   /* HAL letterbox: the placement HAL computes */
+  LETTERBOX_VIEW,     /* packed output: convert into a view of it */
+  LETTERBOX_STAGED,   /* planar output: view of a packed U8 stage */
+} LetterboxMode;
+
 struct _EdgefirstCameraAdaptor {
   GstBaseTransform parent;
 
@@ -190,11 +201,21 @@ struct _EdgefirstCameraAdaptor {
   gchar *model_std;
 
   /* Runtime state */
-  hal_image_processor *processor;
+  ef_image_processor *processor;
   GstVideoInfo in_info;
   gboolean in_info_valid;
-  hal_crop crop;
-  gboolean crop_valid;
+
+  /* Letterbox placement: the image is converted into this rectangle of the
+   * output and the rest of the output holds fill_rgba. */
+  LetterboxMode lb_mode;
+  guint dst_x;
+  guint dst_y;
+  guint dst_w;
+  guint dst_h;
+  guint8 fill_rgba[4];
+  ef_crop native_crop;       /* LETTERBOX_NATIVE */
+  ef_tensor *stage;          /* LETTERBOX_STAGED: packed U8 output */
+  ef_tensor *stage_view;     /* LETTERBOX_STAGED: placement within stage */
 
   /* Output dimensions */
   guint out_width, out_height, out_channels;
@@ -203,9 +224,9 @@ struct _EdgefirstCameraAdaptor {
    * Input cache keys are heap-allocated InputCacheKey structs (inode + offset).
    * Using inode instead of fd makes the cache robust to fd number recycling:
    * the kernel dma_buf inode is stable for the lifetime of the buffer. */
-  GHashTable *input_cache;   /* InputCacheKey* -> hal_tensor* */
-  GHashTable *output_cache;  /* fd -> hal_tensor* (pool has one buffer, offset=0) */
-  hal_tensor *hal_output;    /* HAL-owned output (when no downstream pool) */
+  GHashTable *input_cache;   /* InputCacheKey* -> ef_tensor* */
+  GHashTable *output_cache;  /* fd -> OutputTensor* (pool has one buffer, offset=0) */
+  struct OutputTensor *hal_output;  /* HAL-owned output (when no downstream pool) */
 
   /* DMA-BUF state */
   gboolean downstream_dmabuf;
@@ -213,8 +234,8 @@ struct _EdgefirstCameraAdaptor {
   gboolean input_is_drm;
 
   /* Target HAL format/dtype (resolved from properties) */
-  enum hal_pixel_format target_format;
-  enum hal_dtype target_dtype;
+  const EdgefirstHalFormat *target_format;
+  uint32_t target_dtype;
 };
 
 /* ── Pad templates ───────────────────────────────────────────────── */
@@ -278,19 +299,6 @@ static GstFlowReturn edgefirst_camera_adaptor_transform (GstBaseTransform *,
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
-static enum hal_pixel_format
-gst_format_to_hal_pixel (GstVideoFormat fmt)
-{
-  switch (fmt) {
-    case GST_VIDEO_FORMAT_NV12:  return HAL_PIXEL_FORMAT_NV12;
-    case GST_VIDEO_FORMAT_YUY2:  return HAL_PIXEL_FORMAT_YUYV;
-    case GST_VIDEO_FORMAT_RGB:   return HAL_PIXEL_FORMAT_RGB;
-    case GST_VIDEO_FORMAT_RGBA:  return HAL_PIXEL_FORMAT_RGBA;
-    case GST_VIDEO_FORMAT_GRAY8: return HAL_PIXEL_FORMAT_GREY;
-    default:                     return (enum hal_pixel_format) -1;
-  }
-}
-
 static const char *
 dtype_to_nnstreamer_string (EdgefirstCameraAdaptorDtype dtype)
 {
@@ -337,38 +345,39 @@ dtype_byte_size (EdgefirstCameraAdaptorDtype dtype)
 static void
 resolve_target_format (EdgefirstCameraAdaptor *self)
 {
-  /* GObject enum values match hal_dtype values 1:1 */
-  static const enum hal_dtype dtype_map[] = {
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT8]   = HAL_DTYPE_U8,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT8]    = HAL_DTYPE_I8,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT16]  = HAL_DTYPE_U16,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT16]   = HAL_DTYPE_I16,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT32]  = HAL_DTYPE_U32,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT32]   = HAL_DTYPE_I32,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT64]  = HAL_DTYPE_U64,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT64]   = HAL_DTYPE_I64,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT16] = HAL_DTYPE_F16,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT32] = HAL_DTYPE_F32,
-    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT64] = HAL_DTYPE_F64,
+  static const uint32_t dtype_map[] = {
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT8]   = EF_DTYPE_U8,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT8]    = EF_DTYPE_I8,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT16]  = EF_DTYPE_U16,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT16]   = EF_DTYPE_I16,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT32]  = EF_DTYPE_U32,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT32]   = EF_DTYPE_I32,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_UINT64]  = EF_DTYPE_U64,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_INT64]   = EF_DTYPE_I64,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT16] = EF_DTYPE_F16,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT32] = EF_DTYPE_F32,
+    [EDGEFIRST_CAMERA_ADAPTOR_DTYPE_FLOAT64] = EF_DTYPE_F64,
   };
+  const gchar *wire;
   self->target_dtype = dtype_map[self->dtype];
   switch (self->colorspace) {
     case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_GRAY:
-      self->target_format = HAL_PIXEL_FORMAT_GREY;
+      wire = EDGEFIRST_HAL_FORMAT_GREY;
       break;
     case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_BGR:
-      self->target_format = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW)
-          ? HAL_PIXEL_FORMAT_PLANAR_RGB : HAL_PIXEL_FORMAT_BGRA;
+      wire = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW)
+          ? EDGEFIRST_HAL_FORMAT_PLANAR_RGB : EDGEFIRST_HAL_FORMAT_BGRA;
       break;
     case EDGEFIRST_CAMERA_ADAPTOR_COLORSPACE_RGBA:
-      self->target_format = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW)
-          ? HAL_PIXEL_FORMAT_PLANAR_RGBA : HAL_PIXEL_FORMAT_RGBA;
+      wire = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW)
+          ? EDGEFIRST_HAL_FORMAT_PLANAR_RGBA : EDGEFIRST_HAL_FORMAT_RGBA;
       break;
     default:
-      self->target_format = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW)
-          ? HAL_PIXEL_FORMAT_PLANAR_RGB : HAL_PIXEL_FORMAT_RGB;
+      wire = (self->layout == EDGEFIRST_CAMERA_ADAPTOR_LAYOUT_CHW)
+          ? EDGEFIRST_HAL_FORMAT_PLANAR_RGB : EDGEFIRST_HAL_FORMAT_RGB;
       break;
   }
+  self->target_format = edgefirst_hal_format_from_wire (wire);
 }
 
 /* ── Tensor cache helpers ─────────────────────────────────────────── */
@@ -376,7 +385,25 @@ resolve_target_format (EdgefirstCameraAdaptor *self)
 static void
 tensor_cache_value_free (gpointer data)
 {
-  hal_tensor_free ((hal_tensor *) data);
+  ef_tensor_free ((ef_tensor *) data);
+}
+
+/* An output tensor and, when letterboxing, the view of it that receives
+ * the converted image. */
+typedef struct OutputTensor {
+  ef_tensor *full;
+  ef_tensor *view;   /* NULL when the image fills the whole output */
+} OutputTensor;
+
+static void
+output_tensor_free (gpointer data)
+{
+  OutputTensor *out = data;
+  if (!out)
+    return;
+  ef_tensor_free (out->view);
+  ef_tensor_free (out->full);
+  g_free (out);
 }
 
 /* Input cache key: identifies a DMA-BUF by its kernel inode number and byte
@@ -411,7 +438,7 @@ init_caches (EdgefirstCameraAdaptor *self)
       input_cache_key_hash, input_cache_key_equal,
       g_free, tensor_cache_value_free);
   self->output_cache = g_hash_table_new_full (
-      g_direct_hash, g_direct_equal, NULL, tensor_cache_value_free);
+      g_direct_hash, g_direct_equal, NULL, output_tensor_free);
 }
 
 static void
@@ -421,10 +448,9 @@ clear_caches (EdgefirstCameraAdaptor *self)
     g_hash_table_remove_all (self->input_cache);
   if (self->output_cache)
     g_hash_table_remove_all (self->output_cache);
-  if (self->hal_output) {
-    hal_tensor_free (self->hal_output);
-    self->hal_output = NULL;
-  }
+  g_clear_pointer (&self->hal_output, output_tensor_free);
+  g_clear_pointer (&self->stage_view, ef_tensor_free);
+  g_clear_pointer (&self->stage, ef_tensor_free);
 }
 
 static void
@@ -432,10 +458,40 @@ destroy_caches (EdgefirstCameraAdaptor *self)
 {
   g_clear_pointer (&self->input_cache, g_hash_table_destroy);
   g_clear_pointer (&self->output_cache, g_hash_table_destroy);
-  if (self->hal_output) {
-    hal_tensor_free (self->hal_output);
-    self->hal_output = NULL;
+  g_clear_pointer (&self->hal_output, output_tensor_free);
+  g_clear_pointer (&self->stage_view, ef_tensor_free);
+  g_clear_pointer (&self->stage, ef_tensor_free);
+}
+
+typedef struct {
+  guint x;
+  guint y;
+  guint w;
+  guint h;
+} LetterboxRect;
+
+/* The centred placement HAL's letterbox uses (edgefirst-image
+ * `letterbox_rect`), so a matching request can use HAL's own letterbox. */
+static LetterboxRect
+hal_letterbox_rect (guint sw, guint sh, guint dw, guint dh)
+{
+  guint new_w = dw;
+  guint new_h = dh;
+  if (sw > 0 && sh > 0) {
+    gdouble src_aspect = (gdouble) sw / sh;
+    gdouble dst_aspect = (gdouble) dw / dh;
+    if (src_aspect > dst_aspect)
+      new_h = MAX ((guint) (dw / src_aspect + 0.5), 1u);
+    else
+      new_w = MAX ((guint) (dh * src_aspect + 0.5), 1u);
   }
+  LetterboxRect r = {
+    .x = (dw - MIN (new_w, dw)) / 2,
+    .y = (dh - MIN (new_h, dh)) / 2,
+    .w = new_w,
+    .h = new_h,
+  };
+  return r;
 }
 
 static void
@@ -447,7 +503,7 @@ compute_letterbox (EdgefirstCameraAdaptor *self, guint src_w, guint src_h)
   if (!self->letterbox || src_w == 0 || src_h == 0) {
     self->lb_scale = 1.0f;
     self->lb_top = self->lb_bottom = self->lb_left = self->lb_right = 0;
-    self->crop_valid = FALSE;
+    self->lb_mode = LETTERBOX_NONE;
     return;
   }
 
@@ -477,17 +533,33 @@ compute_letterbox (EdgefirstCameraAdaptor *self, guint src_w, guint src_h)
   guint w = dst_w - (guint) MAX (self->lb_left, 0) - (guint) MAX (self->lb_right, 0);
   guint h = dst_h - (guint) MAX (self->lb_top, 0) - (guint) MAX (self->lb_bottom, 0);
 
-  self->crop = hal_crop_new ();
-  struct hal_rect dst_rect = hal_rect_new (x, y, w, h);
-  hal_crop_set_dst_rect (&self->crop, &dst_rect);
+  self->dst_x = x;
+  self->dst_y = y;
+  self->dst_w = w;
+  self->dst_h = h;
 
   guint8 r = (self->fill_color >> 24) & 0xFF;
   guint8 g = (self->fill_color >> 16) & 0xFF;
   guint8 b = (self->fill_color >>  8) & 0xFF;
   guint8 a = (self->fill_color      ) & 0xFF;
-  hal_crop_set_dst_color (&self->crop, r, g, b, a);
+  self->fill_rgba[0] = r;
+  self->fill_rgba[1] = g;
+  self->fill_rgba[2] = b;
+  self->fill_rgba[3] = a;
 
-  self->crop_valid = TRUE;
+  LetterboxRect hal = hal_letterbox_rect (src_w, src_h, dst_w, dst_h);
+  if (x == 0 && y == 0 && w == dst_w && h == dst_h) {
+    self->lb_mode = LETTERBOX_NONE;
+  } else if (x == hal.x && y == hal.y && w == hal.w && h == hal.h) {
+    self->lb_mode = LETTERBOX_NATIVE;
+    memset (&self->native_crop, 0, sizeof (self->native_crop));
+    self->native_crop.letterbox = 1;
+    memcpy (self->native_crop.pad, self->fill_rgba, 4);
+  } else if (self->target_format->layout == EDGEFIRST_HAL_LAYOUT_PACKED) {
+    self->lb_mode = LETTERBOX_VIEW;
+  } else {
+    self->lb_mode = LETTERBOX_STAGED;
+  }
 
   GST_DEBUG_OBJECT (self, "letterbox: %ux%u → %ux%u in %ux%u "
       "(scale %.4f, T=%d B=%d L=%d R=%d, fill #%02x%02x%02x)",
@@ -501,21 +573,21 @@ compute_letterbox (EdgefirstCameraAdaptor *self, guint src_w, guint src_h)
  * V4L2/ISP pools rotate ~4 fds; after one rotation every frame is a cache hit.
  * Returns a cached tensor (caller must NOT free).
  */
-static hal_tensor *
+static ef_tensor *
 lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
 {
   GstVideoInfo *info = &self->in_info;
   guint width = GST_VIDEO_INFO_WIDTH (info);
   guint height = GST_VIDEO_INFO_HEIGHT (info);
   GstVideoFormat vfmt = GST_VIDEO_INFO_FORMAT (info);
-  enum hal_pixel_format pixel_fmt = gst_format_to_hal_pixel (vfmt);
+  const EdgefirstHalFormat *pixel_fmt = edgefirst_hal_format_from_gst (vfmt);
 
   /* Note: for NV12 from v4l2h264dec, each DMA-BUF fd covers only its own
    * plane. The Y fd buffer size includes the aligned height (e.g. 1088 rows).
    * We pass the nominal height here; the HAL derives the actual allocation
    * size from fstat on the fd. */
 
-  if ((int) pixel_fmt == -1) {
+  if (!pixel_fmt) {
     GST_ERROR_OBJECT (self, "unsupported input format %s",
         gst_video_format_to_string (vfmt));
     return NULL;
@@ -548,35 +620,30 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
   InputCacheKey lookup_key = { .inode = st.st_ino, .offset = offset };
 
   /* Cache lookup — no allocation needed for lookup, only for insert */
-  hal_tensor *cached = g_hash_table_lookup (self->input_cache, &lookup_key);
+  ef_tensor *cached = g_hash_table_lookup (self->input_cache, &lookup_key);
   if (cached) {
     GST_LOG_OBJECT (self, "input cache hit fd=%d inode=%" G_GUINT64_FORMAT
         " offset=%" G_GSIZE_FORMAT, fd, (guint64) st.st_ino, offset);
     return cached;
   }
 
-  /* Cache miss — import via PlaneDescriptor */
+  /* Cache miss — import the planes */
   GST_DEBUG_OBJECT (self, "input cache miss fd=%d inode=%" G_GUINT64_FORMAT
       " offset=%" G_GSIZE_FORMAT " importing %ux%u %s",
       fd, (guint64) st.st_ino, offset, width, height,
       gst_video_format_to_string (vfmt));
 
-  struct hal_plane_descriptor *pd = hal_plane_descriptor_new (fd);
-  if (!pd) {
-    GST_ERROR_OBJECT (self, "hal_plane_descriptor_new failed for fd=%d", fd);
-    return NULL;
-  }
-  if (offset > 0)
-    hal_plane_descriptor_set_offset (pd, offset);
+  EdgefirstHalPlane image = { .fd = fd, .offset = offset };
 
   /* Set stride if padded (e.g. VPU buffers) */
   GstVideoMeta *vmeta = gst_buffer_get_video_meta (inbuf);
   gint stride = vmeta ? (gint) vmeta->stride[0]
                       : GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
-  hal_plane_descriptor_set_stride (pd, (size_t) stride);
+  image.stride = (gsize) MAX (stride, 0);
 
-  struct hal_plane_descriptor *chroma = NULL;
-  if (pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
+  EdgefirstHalPlane chroma_plane = { .fd = -1 };
+  EdgefirstHalPlane *chroma = NULL;
+  if (pixel_fmt->layout == EDGEFIRST_HAL_LAYOUT_SEMI_PLANAR) {
     /* Diagnostic: dump all available NV12 plane info */
     GST_INFO_OBJECT (self, "NV12 import: n_mem=%u vmeta=%p", n_mem, (void *) vmeta);
     if (vmeta) {
@@ -611,13 +678,10 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
             ? (gint) vmeta->stride[1]
             : GST_VIDEO_INFO_PLANE_STRIDE (info, 1);
 
-        chroma = hal_plane_descriptor_new (uv_fd);
-        if (chroma) {
-          if (mem1_offset > 0)
-            hal_plane_descriptor_set_offset (chroma, mem1_offset);
-          if (uv_stride > 0)
-            hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
-        }
+        chroma_plane.fd = uv_fd;
+        chroma_plane.offset = mem1_offset;
+        chroma_plane.stride = (gsize) MAX (uv_stride, 0);
+        chroma = &chroma_plane;
         GST_INFO_OBJECT (self, "  NV12 two-fd planes: y_fd=%d uv_fd=%d "
             "mem1_offset=%" G_GSIZE_FORMAT " uv_stride=%d",
             fd, uv_fd, mem1_offset, uv_stride);
@@ -644,14 +708,12 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
       }
 
       if (uv_offset > 0) {
-        chroma = hal_plane_descriptor_new (fd);
-        if (chroma) {
-          hal_plane_descriptor_set_offset (chroma, uv_offset);
-          if (uv_stride > 0)
-            hal_plane_descriptor_set_stride (chroma, (size_t) uv_stride);
-          GST_INFO_OBJECT (self, "  NV12 single-mem: uv_offset=%" G_GSIZE_FORMAT
-              " uv_stride=%d", uv_offset, uv_stride);
-        }
+        chroma_plane.fd = fd;
+        chroma_plane.offset = uv_offset;
+        chroma_plane.stride = (gsize) MAX (uv_stride, 0);
+        chroma = &chroma_plane;
+        GST_INFO_OBJECT (self, "  NV12 single-mem: uv_offset=%" G_GSIZE_FORMAT
+            " uv_stride=%d", uv_offset, uv_stride);
       } else {
         GST_ERROR_OBJECT (self, "  NV12 single-mem: cannot determine UV offset!");
       }
@@ -661,11 +723,10 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
       GST_WARNING_OBJECT (self, "  NV12 import WITHOUT chroma plane — will produce bad output");
   }
 
-  /* hal_import_image CONSUMES pd and chroma */
-  hal_tensor *tensor = hal_import_image (self->processor,
-      pd, chroma, width, height, pixel_fmt, HAL_DTYPE_U8);
+  ef_tensor *tensor = edgefirst_hal_import_image (GST_OBJECT (self),
+      &image, chroma, width, height, pixel_fmt, EF_DTYPE_U8);
   if (!tensor) {
-    GST_ERROR_OBJECT (self, "hal_import_image failed for fd=%d", fd);
+    GST_ERROR_OBJECT (self, "HAL image import failed for fd=%d", fd);
     return NULL;
   }
 
@@ -677,16 +738,16 @@ lookup_or_import_input (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
 
 /**
  * System-memory fallback: allocate a HAL tensor and memcpy the frame data.
- * Returns a new tensor the caller MUST free with hal_tensor_free().
+ * Returns a new tensor the caller MUST free with ef_tensor_free().
  */
-static hal_tensor *
+static ef_tensor *
 create_input_from_sysmem (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
 {
   GstVideoInfo *info = &self->in_info;
   guint width = GST_VIDEO_INFO_WIDTH (info);
   guint height = GST_VIDEO_INFO_HEIGHT (info);
   GstVideoFormat vfmt = GST_VIDEO_INFO_FORMAT (info);
-  enum hal_pixel_format pixel_fmt = gst_format_to_hal_pixel (vfmt);
+  const EdgefirstHalFormat *pixel_fmt = edgefirst_hal_format_from_gst (vfmt);
 
   static gboolean warned = FALSE;
   if (G_UNLIKELY (!warned)) {
@@ -695,67 +756,65 @@ create_input_from_sysmem (EdgefirstCameraAdaptor *self, GstBuffer *inbuf)
         "(zero-copy disabled)");
   }
 
-  hal_tensor *tensor = hal_image_processor_create_image (self->processor,
-      (size_t) width, (size_t) height, pixel_fmt, HAL_DTYPE_U8);
-  if (!tensor) {
-    GST_ERROR_OBJECT (self, "hal_image_processor_create_image failed");
+  if (!pixel_fmt) {
+    GST_ERROR_OBJECT (self, "unsupported input format %s",
+        gst_video_format_to_string (vfmt));
     return NULL;
   }
 
-  struct hal_tensor_map *tmap = hal_tensor_map_create (tensor);
-  if (!tmap) {
-    hal_tensor_free (tensor);
+  ef_tensor *tensor = edgefirst_hal_create_image (self->processor,
+      width, height, pixel_fmt, EF_DTYPE_U8);
+  if (!tensor) {
+    GST_ERROR_OBJECT (self, "HAL image allocation failed: %s",
+        ef_tensor_last_error_message ());
     return NULL;
   }
-  uint8_t *dst = (uint8_t *) hal_tensor_map_data (tmap);
+
+  ef_tensor_view view;
+  if (ef_tensor_map (tensor, EF_CPU_ACCESS_WRITE, &view) != 0) {
+    ef_tensor_free (tensor);
+    return NULL;
+  }
+  uint8_t *dst = view.ptr;
 
   GstVideoFrame frame;
   if (!gst_video_frame_map (&frame, info, inbuf, GST_MAP_READ)) {
-    hal_tensor_map_unmap (tmap);
-    hal_tensor_free (tensor);
+    ef_tensor_unmap (tensor);
+    ef_tensor_free (tensor);
     return NULL;
   }
 
-  /* Row-by-row copy handles stride padding from VPU/ISP buffers */
-  size_t row_bytes;
-  switch (pixel_fmt) {
-    case HAL_PIXEL_FORMAT_RGBA:
-    case HAL_PIXEL_FORMAT_BGRA:         row_bytes = width * 4; break;
-    case HAL_PIXEL_FORMAT_RGB:
-    case HAL_PIXEL_FORMAT_PLANAR_RGB:   row_bytes = width * 3; break;
-    case HAL_PIXEL_FORMAT_YUYV:
-    case HAL_PIXEL_FORMAT_VYUY:
-    case HAL_PIXEL_FORMAT_NV16:         row_bytes = width * 2; break;
-    case HAL_PIXEL_FORMAT_NV12:
-    case HAL_PIXEL_FORMAT_GREY:         row_bytes = width;     break;
-    default:                            row_bytes = width * 3; break;
-  }
+  /* Row-by-row copy handles stride padding on either side */
+  gsize row_bytes = edgefirst_hal_format_row_bytes (pixel_fmt, width);
+  gsize dst_stride = edgefirst_hal_row_stride (tensor);
+  if (dst_stride < row_bytes)
+    dst_stride = row_bytes;
 
-  if (pixel_fmt == HAL_PIXEL_FORMAT_NV12) {
+  if (pixel_fmt->layout == EDGEFIRST_HAL_LAYOUT_SEMI_PLANAR) {
     /* Y plane */
     const guint8 *y_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
     gint y_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
     for (guint y = 0; y < height; y++)
-      memcpy (dst + y * width, y_data + y * y_stride, width);
+      memcpy (dst + y * dst_stride, y_data + y * y_stride, width);
     /* UV plane */
     const guint8 *uv_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 1);
     gint uv_stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 1);
-    uint8_t *uv_dst = dst + height * width;
+    uint8_t *uv_dst = dst + height * dst_stride;
     for (guint y = 0; y < height / 2; y++)
-      memcpy (uv_dst + y * width, uv_data + y * uv_stride, width);
+      memcpy (uv_dst + y * dst_stride, uv_data + y * uv_stride, width);
   } else {
     const guint8 *src_data = GST_VIDEO_FRAME_PLANE_DATA (&frame, 0);
     gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
-    if ((gsize) stride == row_bytes) {
+    if ((gsize) stride == row_bytes && dst_stride == row_bytes) {
       memcpy (dst, src_data, row_bytes * height);
     } else {
       for (guint y = 0; y < height; y++)
-        memcpy (dst + y * row_bytes, src_data + y * stride, row_bytes);
+        memcpy (dst + y * dst_stride, src_data + y * stride, row_bytes);
     }
   }
 
   gst_video_frame_unmap (&frame);
-  hal_tensor_map_unmap (tmap);
+  ef_tensor_unmap (tensor);
   return tensor;
 }
 
@@ -793,7 +852,7 @@ edgefirst_camera_adaptor_finalize (GObject *object)
     gst_buffer_pool_set_active (self->downstream_pool, FALSE);
     gst_clear_object (&self->downstream_pool);
   }
-  g_clear_pointer (&self->processor, hal_image_processor_free);
+  g_clear_pointer (&self->processor, ef_image_processor_free);
   g_free (self->model_mean);
   g_free (self->model_std);
 
@@ -935,11 +994,11 @@ edgefirst_camera_adaptor_start (GstBaseTransform *trans)
   EdgefirstCameraAdaptor *self = EDGEFIRST_CAMERA_ADAPTOR (trans);
 
   /* Map GStreamer compute property to HAL backend enum */
-  static const enum hal_compute_backend compute_map[] = {
-    [EDGEFIRST_CAMERA_ADAPTOR_COMPUTE_AUTO]   = HAL_COMPUTE_BACKEND_AUTO,
-    [EDGEFIRST_CAMERA_ADAPTOR_COMPUTE_OPENGL] = HAL_COMPUTE_BACKEND_OPENGL,
-    [EDGEFIRST_CAMERA_ADAPTOR_COMPUTE_G2D]    = HAL_COMPUTE_BACKEND_G2D,
-    [EDGEFIRST_CAMERA_ADAPTOR_COMPUTE_CPU]    = HAL_COMPUTE_BACKEND_CPU,
+  static const uint32_t compute_map[] = {
+    [EDGEFIRST_CAMERA_ADAPTOR_COMPUTE_AUTO]   = EDGEFIRST_HAL_BACKEND_AUTO,
+    [EDGEFIRST_CAMERA_ADAPTOR_COMPUTE_OPENGL] = EDGEFIRST_HAL_BACKEND_OPENGL,
+    [EDGEFIRST_CAMERA_ADAPTOR_COMPUTE_G2D]    = EDGEFIRST_HAL_BACKEND_G2D,
+    [EDGEFIRST_CAMERA_ADAPTOR_COMPUTE_CPU]    = EDGEFIRST_HAL_BACKEND_CPU,
   };
   static const char *compute_names[] = {
     [EDGEFIRST_CAMERA_ADAPTOR_COMPUTE_AUTO]   = "auto",
@@ -950,11 +1009,11 @@ edgefirst_camera_adaptor_start (GstBaseTransform *trans)
   const char *backend_str = compute_names[self->compute];
 
   /* Route HAL internal logs through GST_DEBUG ("edgefirst-hal" category) */
-  hal_log_init_callback (hal_log_to_gst, NULL,
+  ef_log_init_callback (hal_log_to_gst, NULL,
       gst_level_to_hal (gst_debug_category_get_threshold (edgefirst_hal_debug)));
 
   GST_INFO_OBJECT (self, "requesting HAL backend: %s", backend_str);
-  self->processor = hal_image_processor_new_with_backend (
+  self->processor = ef_image_processor_new_with_backend (
       compute_map[self->compute]);
 
   if (!self->processor) {
@@ -979,7 +1038,7 @@ edgefirst_camera_adaptor_stop (GstBaseTransform *trans)
     gst_buffer_pool_set_active (self->downstream_pool, FALSE);
     gst_clear_object (&self->downstream_pool);
   }
-  g_clear_pointer (&self->processor, hal_image_processor_free);
+  g_clear_pointer (&self->processor, ef_image_processor_free);
   self->in_info_valid = FALSE;
   self->input_is_drm = FALSE;
 
@@ -1054,28 +1113,28 @@ edgefirst_camera_adaptor_transform_caps (GstBaseTransform *trans,
       }
     }
   } else {
-    /* Src → Sink: accept supported video formats.
+    /* Src → Sink: accept the video formats the HAL format table maps.
      * Build DMA_DRM caps with explicit drm-format list so upstream
      * (e.g. v4l2h264dec) only selects formats HAL can process. */
-    static const GstVideoFormat supported_fmts[] = {
-      GST_VIDEO_FORMAT_NV12,
-      GST_VIDEO_FORMAT_YUY2,
-      GST_VIDEO_FORMAT_RGB,
-      GST_VIDEO_FORMAT_RGBA,
-      GST_VIDEO_FORMAT_GRAY8,
-    };
-
-    /* Build drm-format string list from supported GstVideoFormats */
     GValue drm_list = G_VALUE_INIT;
+    GValue fmt_list = G_VALUE_INIT;
     g_value_init (&drm_list, GST_TYPE_LIST);
-    for (guint i = 0; i < G_N_ELEMENTS (supported_fmts); i++) {
-      guint32 drm_fourcc =
-          gst_video_dma_drm_fourcc_from_format (supported_fmts[i]);
+    g_value_init (&fmt_list, GST_TYPE_LIST);
+    for (const EdgefirstHalFormat *f = edgefirst_hal_formats (); f->wire; f++) {
+      if (f->gst == GST_VIDEO_FORMAT_UNKNOWN)
+        continue;
+
+      GValue v = G_VALUE_INIT;
+      g_value_init (&v, G_TYPE_STRING);
+      g_value_set_static_string (&v, gst_video_format_to_string (f->gst));
+      gst_value_list_append_value (&fmt_list, &v);
+      g_value_unset (&v);
+
+      guint32 drm_fourcc = gst_video_dma_drm_fourcc_from_format (f->gst);
       if (drm_fourcc != 0) {
         gchar *drm_str =
             gst_video_dma_drm_fourcc_to_string (drm_fourcc, 0);
         if (drm_str) {
-          GValue v = G_VALUE_INIT;
           g_value_init (&v, G_TYPE_STRING);
           g_value_take_string (&v, drm_str);
           gst_value_list_append_value (&drm_list, &v);
@@ -1094,21 +1153,24 @@ edgefirst_camera_adaptor_transform_caps (GstBaseTransform *trans,
     gst_structure_set_value (drm_s, "drm-format", &drm_list);
     g_value_unset (&drm_list);
 
-    /* Non-DRM DMA-BUF caps (preferred over system memory) */
-    GstCaps *raw_caps = gst_caps_from_string (
-        "video/x-raw(memory:DMABuf), "
-          "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
-          "width=[1,MAX], height=[1,MAX]");
+    /* Non-DMA_DRM DMA-BUF caps (preferred over system memory) */
+    GstCaps *raw_caps = gst_caps_new_empty_simple ("video/x-raw");
+    GstStructure *raw_s = gst_caps_get_structure (raw_caps, 0);
+    gst_structure_set_value (raw_s, "format", &fmt_list);
+    g_value_unset (&fmt_list);
+    gst_structure_set (raw_s,
+        "width", GST_TYPE_INT_RANGE, 1, G_MAXINT,
+        "height", GST_TYPE_INT_RANGE, 1, G_MAXINT,
+        NULL);
 
     /* System memory caps: sources like libcamerasrc declare video/x-raw
      * without memory:DMABuf even though their allocator produces
      * DMABuf-backed memory (linear/mappable DMABuf omits the feature per
      * GStreamer convention).  Accept video/x-raw so caps negotiation
      * succeeds; actual memory type is verified at runtime. */
-    GstCaps *sys_caps = gst_caps_from_string (
-        "video/x-raw, "
-          "format={NV12, YUY2, RGB, RGBA, GRAY8}, "
-          "width=[1,MAX], height=[1,MAX]");
+    GstCaps *sys_caps = gst_caps_copy (raw_caps);
+    gst_caps_set_features (raw_caps, 0,
+        gst_caps_features_new ("memory:DMABuf", NULL));
 
     result = drm_caps;
     gst_caps_append (result, raw_caps);
@@ -1179,7 +1241,7 @@ edgefirst_camera_adaptor_set_caps (GstBaseTransform *trans,
   guint src_h = GST_VIDEO_INFO_HEIGHT (&self->in_info);
   GstVideoFormat vfmt = GST_VIDEO_INFO_FORMAT (&self->in_info);
 
-  if ((int) gst_format_to_hal_pixel (vfmt) == -1) {
+  if (!edgefirst_hal_format_from_gst (vfmt)) {
     GST_ERROR_OBJECT (self, "unsupported input format %s",
         gst_video_format_to_string (vfmt));
     return FALSE;
@@ -1330,12 +1392,116 @@ edgefirst_camera_adaptor_decide_allocation (GstBaseTransform *trans,
 /* ── Output tensor lookup ────────────────────────────────────────── */
 
 /**
+ * Fill an output tensor with the letterbox colour and take the view the
+ * image is converted into. Converts only ever write inside the view, so the
+ * padding persists for the life of the tensor.
+ */
+static gboolean
+prepare_letterbox_output (EdgefirstCameraAdaptor *self, OutputTensor *out)
+{
+  if (self->lb_mode != LETTERBOX_VIEW)
+    return TRUE;
+
+  /* The fill colour goes through the same HAL conversion as the image, so
+   * the padding lands in the output's format, layout and dtype. */
+  const EdgefirstHalFormat *rgba =
+      edgefirst_hal_format_from_wire (EDGEFIRST_HAL_FORMAT_RGBA);
+  const guint fill_size = 16;
+  ef_tensor *fill = edgefirst_hal_create_image (self->processor,
+      fill_size, fill_size, rgba, EF_DTYPE_U8);
+  if (!fill) {
+    GST_ERROR_OBJECT (self, "letterbox fill allocation failed: %s",
+        ef_tensor_last_error_message ());
+    return FALSE;
+  }
+  ef_tensor_view view;
+  if (ef_tensor_map (fill, EF_CPU_ACCESS_WRITE, &view) != 0) {
+    ef_tensor_free (fill);
+    return FALSE;
+  }
+  gsize stride = edgefirst_hal_row_stride (fill);
+  if (stride < fill_size * 4)
+    stride = fill_size * 4;
+  for (guint y = 0; y < fill_size; y++)
+    for (guint x = 0; x < fill_size; x++)
+      memcpy (view.ptr + y * stride + x * 4, self->fill_rgba, 4);
+  ef_tensor_unmap (fill);
+
+  int ret = ef_image_processor_convert (self->processor, fill, out->full,
+      EDGEFIRST_HAL_ROTATION_NONE, EDGEFIRST_HAL_FLIP_NONE, NULL);
+  ef_tensor_free (fill);
+  if (ret != 0) {
+    GST_ERROR_OBJECT (self, "letterbox fill failed (%d): %s", ret,
+        ef_tensor_last_error_message ());
+    return FALSE;
+  }
+
+  out->view = ef_tensor_view_region (out->full, self->dst_x, self->dst_y,
+      self->dst_w, self->dst_h);
+  if (!out->view) {
+    GST_ERROR_OBJECT (self, "letterbox view %ux%u+%u+%u refused: %s",
+        self->dst_w, self->dst_h, self->dst_x, self->dst_y,
+        ef_tensor_last_error_message ());
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Create the packed U8 image a planar output is letterboxed through: the
+ * fill colour everywhere, and a view at the placement for the convert.
+ */
+static gboolean
+ensure_letterbox_stage (EdgefirstCameraAdaptor *self)
+{
+  if (self->stage)
+    return TRUE;
+
+  const EdgefirstHalFormat *fmt = edgefirst_hal_format_from_wire (
+      self->target_format->channels == 4 ? EDGEFIRST_HAL_FORMAT_RGBA
+                                         : EDGEFIRST_HAL_FORMAT_RGB);
+  ef_tensor *stage = edgefirst_hal_create_image (self->processor,
+      self->out_width, self->out_height, fmt, EF_DTYPE_U8);
+  if (!stage) {
+    GST_ERROR_OBJECT (self, "letterbox stage allocation failed: %s",
+        ef_tensor_last_error_message ());
+    return FALSE;
+  }
+
+  ef_tensor_view view;
+  if (ef_tensor_map (stage, EF_CPU_ACCESS_WRITE, &view) != 0) {
+    ef_tensor_free (stage);
+    return FALSE;
+  }
+  gsize row_bytes = edgefirst_hal_format_row_bytes (fmt, self->out_width);
+  gsize stride = MAX (edgefirst_hal_row_stride (stage), row_bytes);
+  for (guint y = 0; y < self->out_height; y++)
+    for (guint x = 0; x < self->out_width; x++)
+      memcpy (view.ptr + y * stride + x * fmt->channels, self->fill_rgba,
+          fmt->channels);
+  ef_tensor_unmap (stage);
+
+  ef_tensor *stage_view = ef_tensor_view_region (stage, self->dst_x,
+      self->dst_y, self->dst_w, self->dst_h);
+  if (!stage_view) {
+    GST_ERROR_OBJECT (self, "letterbox view %ux%u+%u+%u refused: %s",
+        self->dst_w, self->dst_h, self->dst_x, self->dst_y,
+        ef_tensor_last_error_message ());
+    ef_tensor_free (stage);
+    return FALSE;
+  }
+  self->stage = stage;
+  self->stage_view = stage_view;
+  return TRUE;
+}
+
+/**
  * Get or create the output HAL tensor for the current frame.
  * When a downstream pool is available, the output buffer's DMA-BUF fd
  * is imported (cached by fd).  Otherwise a HAL-owned image is allocated
  * once and reused for all frames.
  */
-static hal_tensor *
+static OutputTensor *
 get_output_tensor (EdgefirstCameraAdaptor *self, GstBuffer *outbuf)
 {
   if (self->downstream_pool) {
@@ -1348,7 +1514,7 @@ get_output_tensor (EdgefirstCameraAdaptor *self, GstBuffer *outbuf)
     int fd = gst_dmabuf_memory_get_fd (out_mem);
     gpointer key = GINT_TO_POINTER (fd);
 
-    hal_tensor *cached = g_hash_table_lookup (self->output_cache, key);
+    OutputTensor *cached = g_hash_table_lookup (self->output_cache, key);
     if (cached) {
       GST_LOG_OBJECT (self, "output cache hit fd=%d", fd);
       return cached;
@@ -1358,42 +1524,42 @@ get_output_tensor (EdgefirstCameraAdaptor *self, GstBuffer *outbuf)
     gst_memory_get_sizes (out_mem, &mem_offset, NULL);
     GST_DEBUG_OBJECT (self, "output cache miss fd=%d offset=%" G_GSIZE_FORMAT ", importing",
         fd, mem_offset);
-    struct hal_plane_descriptor *pd = hal_plane_descriptor_new (fd);
-    if (!pd) {
-      GST_ERROR_OBJECT (self, "hal_plane_descriptor_new failed for output fd=%d", fd);
-      return NULL;
-    }
-    if (mem_offset > 0) {
-      if (hal_plane_descriptor_set_offset (pd, (size_t) mem_offset) != 0) {
-        GST_ERROR_OBJECT (self,
-            "hal_plane_descriptor_set_offset failed for fd=%d offset=%" G_GSIZE_FORMAT,
-            fd, mem_offset);
-        hal_plane_descriptor_free (pd);
-        return NULL;
-      }
-    }
-
-    hal_tensor *tensor = hal_import_image (self->processor,
-        pd, NULL, self->out_width, self->out_height,
+    EdgefirstHalPlane plane = { .fd = fd, .offset = mem_offset };
+    OutputTensor *out = g_new0 (OutputTensor, 1);
+    out->full = edgefirst_hal_import_image (GST_OBJECT (self), &plane, NULL,
+        self->out_width, self->out_height,
         self->target_format, self->target_dtype);
-    if (!tensor) {
-      GST_ERROR_OBJECT (self, "hal_import_image failed for output fd=%d", fd);
+    if (!out->full) {
+      GST_ERROR_OBJECT (self, "HAL image import failed for output fd=%d", fd);
+      output_tensor_free (out);
+      return NULL;
+    }
+    if (!prepare_letterbox_output (self, out)) {
+      output_tensor_free (out);
       return NULL;
     }
 
-    g_hash_table_insert (self->output_cache, key, tensor);
-    return tensor;
+    g_hash_table_insert (self->output_cache, key, out);
+    return out;
   }
 
   /* No downstream pool — use HAL-owned output (allocated once) */
   if (!self->hal_output) {
-    self->hal_output = hal_image_processor_create_image (self->processor,
+    OutputTensor *out = g_new0 (OutputTensor, 1);
+    out->full = edgefirst_hal_create_image (self->processor,
         self->out_width, self->out_height,
         self->target_format, self->target_dtype);
-    if (!self->hal_output) {
-      GST_ERROR_OBJECT (self, "hal_image_processor_create_image failed");
+    if (!out->full) {
+      GST_ERROR_OBJECT (self, "HAL image allocation failed: %s",
+          ef_tensor_last_error_message ());
+      output_tensor_free (out);
       return NULL;
     }
+    if (!prepare_letterbox_output (self, out)) {
+      output_tensor_free (out);
+      return NULL;
+    }
+    self->hal_output = out;
     GST_DEBUG_OBJECT (self, "created HAL-owned output %ux%u",
         self->out_width, self->out_height);
   }
@@ -1442,7 +1608,7 @@ edgefirst_camera_adaptor_transform (GstBaseTransform *trans,
 
   /* Try DMA-BUF zero-copy import first; fall back to memcpy for system memory */
   gboolean src_owned = FALSE;
-  hal_tensor *src = lookup_or_import_input (self, inbuf);
+  ef_tensor *src = lookup_or_import_input (self, inbuf);
   if (!src) {
     src = create_input_from_sysmem (self, inbuf);
     src_owned = TRUE;
@@ -1452,38 +1618,66 @@ edgefirst_camera_adaptor_transform (GstBaseTransform *trans,
     return GST_FLOW_ERROR;
   }
 
-  hal_tensor *dst = get_output_tensor (self, outbuf);
+  OutputTensor *dst = get_output_tensor (self, outbuf);
   if (!dst) {
     GST_ERROR_OBJECT (self, "failed to get output tensor");
-    if (src_owned) hal_tensor_free (src);
+    if (src_owned) ef_tensor_free (src);
     return GST_FLOW_ERROR;
   }
 
-  int ret = hal_image_processor_convert (self->processor, src, dst,
-      HAL_ROTATION_NONE, HAL_FLIP_NONE,
-      self->crop_valid ? &self->crop : NULL);
+  int ret;
+  switch (self->lb_mode) {
+    case LETTERBOX_NATIVE:
+      ret = ef_image_processor_convert (self->processor, src, dst->full,
+          EDGEFIRST_HAL_ROTATION_NONE, EDGEFIRST_HAL_FLIP_NONE,
+          &self->native_crop);
+      break;
+    case LETTERBOX_VIEW:
+      ret = ef_image_processor_convert (self->processor, src, dst->view,
+          EDGEFIRST_HAL_ROTATION_NONE, EDGEFIRST_HAL_FLIP_NONE, NULL);
+      break;
+    case LETTERBOX_STAGED:
+      if (!ensure_letterbox_stage (self)) {
+        ret = -1;
+        break;
+      }
+      ret = ef_image_processor_convert (self->processor, src,
+          self->stage_view, EDGEFIRST_HAL_ROTATION_NONE,
+          EDGEFIRST_HAL_FLIP_NONE, NULL);
+      if (ret == 0)
+        ret = ef_image_processor_convert (self->processor, self->stage,
+            dst->full, EDGEFIRST_HAL_ROTATION_NONE, EDGEFIRST_HAL_FLIP_NONE,
+            NULL);
+      break;
+    case LETTERBOX_NONE:
+    default:
+      ret = ef_image_processor_convert (self->processor, src, dst->full,
+          EDGEFIRST_HAL_ROTATION_NONE, EDGEFIRST_HAL_FLIP_NONE, NULL);
+      break;
+  }
 
-  if (src_owned) hal_tensor_free (src);
+  if (src_owned) ef_tensor_free (src);
 
   if (ret != 0) {
-    GST_ERROR_OBJECT (self, "hal_image_processor_convert failed (%d)", ret);
+    GST_ERROR_OBJECT (self, "HAL convert failed (%d): %s", ret,
+        ef_tensor_last_error_message ());
     return GST_FLOW_ERROR;
   }
 
   /* When using HAL-owned output (no downstream DMA-BUF pool), the convert
    * wrote into self->hal_output, not outbuf. Copy the result out. */
   if (!self->downstream_pool && self->hal_output) {
-    struct hal_tensor_map *tmap = hal_tensor_map_create (self->hal_output);
-    if (tmap) {
+    ef_tensor_view view;
+    if (ef_tensor_map (self->hal_output->full, EF_CPU_ACCESS_READ, &view) == 0) {
       GstMapInfo map;
       if (gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
         gsize copy_size = MIN (map.size,
             (gsize) self->out_width * self->out_height * self->out_channels
             * dtype_byte_size (self->dtype));
-        memcpy (map.data, hal_tensor_map_data_const (tmap), copy_size);
+        memcpy (map.data, view.ptr, MIN (copy_size, view.len));
         gst_buffer_unmap (outbuf, &map);
       }
-      hal_tensor_map_unmap (tmap);
+      ef_tensor_unmap (self->hal_output->full);
     }
   }
 

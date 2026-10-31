@@ -1,4 +1,4 @@
-if not edgefirst_hal_dep.found()
+if not edgefirst_hal_found
   subdir_done()
 endif
 
@@ -6,6 +6,7 @@ gst_hal_sources = files(
   'plugin.c',
   'edgefirstcameraadaptor.c',
   'edgefirstoverlay.c',
+  'edgefirsthalutils.c',
 )
 
 hal_deps = [
@@ -13,7 +14,8 @@ hal_deps = [
     gst_base_dep,
     gst_video_dep,
     gst_allocators_dep,
-    edgefirst_hal_dep,
+    edgefirst_image_dep,
+    edgefirst_decoder_dep,
     gstedgefirst_dep,
 ]
 

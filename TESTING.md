@@ -234,8 +234,18 @@ GST_DEBUG=edgefirst*:5 meson test -C builddir -v
 | `test_camera_adaptor_chw_int8` | CHW + int8 (Ara-2 workflow): 320x240 → 230400 bytes |
 | `test_camera_adaptor_bgr_hwc` | BGR HWC uint8: 320x240 → 230400 bytes |
 | `test_camera_adaptor_letterbox_properties` | Verify letterbox-scale, letterbox-top, letterbox-left after negotiation |
+| `test_camera_adaptor_letterbox_fill` | Centred letterbox: image rows are white, padding rows carry `fill-color` |
+| `test_camera_adaptor_letterbox_override` | `letterbox-top=0` moves the image to the top, padding below it |
+| `test_camera_adaptor_letterbox_override_chw_int8` | Same override with planar int8 output (staged through a packed image) |
 
-**Note**: HAL tests require edgefirst-hal to be available at build time. The
+**HAL vocabulary and detection type tests (2):**
+
+| Test | Description |
+|------|-------------|
+| `test_hal_format_table` | Every row of the GStreamer ↔ HAL format table is a wire name the linked HAL accepts, with the allocation shape the table predicts |
+| `test_detection_lists` | `EdgeFirstDetectBoxList` copies and normalizes HAL boxes; `EdgeFirstSegmentationList` borrows masks until it releases their owner |
+
+**Note**: HAL tests require the EdgeFirst HAL C libraries (>= 0.34.1) at build time. The
 pipeline tests use `videotestsrc` and work without hardware. NEON kernel tests
 use scalar fallback implementations on non-ARM platforms.
 

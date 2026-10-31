@@ -58,7 +58,7 @@ if gst_check_dep.found()
   test('fusion_elements', test_fusion, env : test_env)
 
   # HAL plugin tests (only when HAL is available)
-  if edgefirst_hal_dep.found()
+  if edgefirst_hal_found
     gst_app_dep = dependency('gstreamer-app-1.0', version : gst_version)
 
     # HAL pipeline tests need system elements (videotestsrc, appsink),
@@ -71,8 +71,10 @@ if gst_check_dep.found()
     hal_src_inc = include_directories('../gst/hal')
     test_hal = executable('test_hal_elements',
       'check/test_hal_elements.c',
-      dependencies : [gst_dep, gst_base_dep, gst_check_dep,
-                      gst_allocators_dep, gst_app_dep, gstedgefirst_dep],
+      '../gst/hal/edgefirsthalutils.c',
+      dependencies : [gst_dep, gst_base_dep, gst_video_dep, gst_check_dep,
+                      gst_allocators_dep, gst_app_dep, gstedgefirst_dep,
+                      edgefirst_image_dep],
       include_directories : [config_inc, hal_src_inc],
       install : true,
       install_dir : test_install_dir,

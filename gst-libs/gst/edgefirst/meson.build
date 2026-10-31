@@ -27,7 +27,7 @@ gstedgefirst_lib = shared_library('edgefirst-gstreamer-1.0',
   gstedgefirst_sources,
   c_args : ['-DBUILDING_GST_EDGEFIRST', '-DHAVE_CONFIG_H'],
   include_directories : [config_inc, edgefirst_inc],
-  dependencies : [gst_dep, gst_base_dep, glib_dep, gobject_dep, edgefirst_hal_dep],
+  dependencies : [gst_dep, gst_base_dep, glib_dep, gobject_dep, edgefirst_decoder_abi_dep],
   version : meson.project_version(),
   soversion : '0',
   install : true,
@@ -36,7 +36,7 @@ gstedgefirst_lib = shared_library('edgefirst-gstreamer-1.0',
 gstedgefirst_dep = declare_dependency(
   link_with : gstedgefirst_lib,
   include_directories : edgefirst_inc,
-  dependencies : [gst_dep, gst_base_dep, edgefirst_hal_dep],
+  dependencies : [gst_dep, gst_base_dep, edgefirst_decoder_abi_dep],
 )
 
 pkg = import('pkgconfig')
@@ -44,6 +44,7 @@ pkg.generate(gstedgefirst_lib,
   name : 'edgefirst-gstreamer-1.0',
   description : 'EdgeFirst Perception GStreamer library',
   subdirs : 'gstreamer-1.0',
+  requires : edgefirst_decoder_abi_dep.found() ? [edgefirst_decoder_abi_dep] : [],
 )
 
 gir_opt = get_option('introspection')
