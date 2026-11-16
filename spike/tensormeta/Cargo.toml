@@ -2,10 +2,11 @@
 name = "gst-plugin-edgefirst-spike"
 version = "0.0.1"
 edition = "2021"
+resolver = "3"
 license = "Apache-2.0"
 description = "Dummy tensor meta element"
 repository = "https://github.com/EdgeFirstAI/gstreamer"
-rust-version = "1.83"
+rust-version = "1.94"
 
 [lib]
 name = "gstedgefirstspike"
