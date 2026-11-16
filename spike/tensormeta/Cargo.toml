@@ -1,0 +1,27 @@
+[package]
+name = "gst-plugin-edgefirst-spike"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Dummy tensor meta element"
+repository = "https://github.com/EdgeFirstAI/gstreamer"
+rust-version = "1.83"
+
+[lib]
+name = "gstedgefirstspike"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+gst = { package = "gstreamer", version = "0.25" }
+gst-base = { package = "gstreamer-base", version = "0.25" }
+gst-video = { package = "gstreamer-video", version = "0.25" }
+gst-analytics = { package = "gstreamer-analytics", version = "0.25", features = ["v1_28"] }
+
+[build-dependencies]
+gst-plugin-version-helper = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "unwind"
